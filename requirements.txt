@@ -1,0 +1,11 @@
+google-api-python-client>=2.88.0
+google-auth-httplib2>=0.1.0
+google-auth-oauthlib>=1.1.0
+google-auth>=2.28.0
+requests>=2.32.0
+requests-oauthlib>=2.0.0
+yt-dlp>=2025.10.01
+python-dotenv>=1.0.0
+ffmpeg-python 
+pytz>=2024.1
+

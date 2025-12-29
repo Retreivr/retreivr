@@ -1,0 +1,22 @@
+# Python / venv
+__pycache__/
+*.pyc
+.venv/
+
+# Local config and secrets
+config/config.json
+config/partial_config.json
+config/Notes.md
+tokens/
+tgbot_token.txt
+rename.sh
+
+# State / outputs
+database/
+logs/
+temp_downloads/
+downloads/
+backups/
+
+# Editor / OS
+.DS_Store

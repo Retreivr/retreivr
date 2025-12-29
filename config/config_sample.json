@@ -1,0 +1,26 @@
+{
+  "poll_interval_minutes": 30,
+  "accounts": {
+    "example_account": {
+      "client_secret": "tokens/client_secret_example.json",
+      "token": "tokens/token_example.json"
+    }
+  },
+  "playlists": [
+    {
+      "playlist_id": "PLXXXXXXXXXXXXXXXXXXXXXXX",
+      "folder": "/path/to/output/folder",
+      "account": "example_account",
+      "remove_after_download": false
+    }
+  ],
+  "yt_dlp_opts": {},
+  "filename_template": "%(title)s - %(uploader)s - %(upload_date)s.%(ext)s",
+  "upload_date_format": "MM-YYYY",
+  "final_format": "webm",
+  "js_runtime": "",
+  "telegram": {
+    "bot_token": "",
+    "chat_id": ""
+  }
+}
