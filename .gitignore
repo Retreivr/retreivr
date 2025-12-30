@@ -20,3 +20,5 @@ backups/
 
 # Editor / OS
 .DS_Store
+._*
+.vscode/
