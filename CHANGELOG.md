@@ -52,11 +52,12 @@ Changed:
 - better date/time format in Status block.
 - clearer log entries when Google Oauth runs to verify playlists.
 
-## 1.1.2 - Publish to GHCR for Easy Docker Pulls from CLI
-No changes from v1.1.1 - just creating new tag to automatically publish to GHCR repo to make docker pulls directly from there.
+## 1.2.0 - OAuth Web UI Helper
+Added:
+- Web UI OAuth helper per account (launches Google auth URL + paste code to save token).
+- API endpoints to support OAuth in the Web UI flow.
 
-Docker Pull Command:
-docker pull ghcr.io/z3ro-2/youtube-archiver:latest
-
-Docker Compose Line:
-image: ghcr.io/z3ro-2/youtube-archiver:latest
+Notes:
+- Docker pulls remain available via GHCR:
+  - `docker pull ghcr.io/z3ro-2/youtube-archiver:latest`
+  - `image: ghcr.io/z3ro-2/youtube-archiver:latest`

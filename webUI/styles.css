@@ -531,6 +531,13 @@ a[aria-disabled="true"] {
   margin: 10px 0 0;
 }
 
+.account-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-left: auto;
+}
+
 .row.space-between {
   justify-content: space-between;
 }
@@ -734,6 +741,11 @@ a[aria-disabled="true"] {
   .button.small {
     padding: 6px 10px;
     font-size: 12px;
+  }
+
+  .account-actions {
+    width: 100%;
+    margin-left: 0;
   }
 
   .table th,

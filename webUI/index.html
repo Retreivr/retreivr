@@ -6,8 +6,8 @@
   <title>YouTube Archiver</title>
   <link rel="icon" href="app_icon.png" type="image/png">
   <link rel="apple-touch-icon" href="app_icon.png">
-  <link rel="stylesheet" href="styles.css?v=1.1.0">
-  <script defer src="app.js?v=1.1.0"></script>
+  <link rel="stylesheet" href="styles.css?v=1.2.0">
+  <script defer src="app.js?v=1.2.0"></script>
 </head>
 <body>
   <div class="backdrop"></div>
@@ -480,6 +480,37 @@
       <div class="row space-between">
         <div class="meta" id="browser-selected">No selection</div>
         <button id="browser-select" class="button small">Use this path</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="oauth-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="oauth-title">
+    <div class="modal-card">
+      <div class="row space-between">
+        <div id="oauth-title" class="panel-title">OAuth Helper</div>
+        <button id="oauth-close" class="button ghost small">Close</button>
+      </div>
+      <div class="stack">
+        <div class="notice">Open the authorization URL, approve access, then paste the code below.</div>
+        <div class="row">
+          <span class="label">Account</span>
+          <span id="oauth-account" class="meta">-</span>
+        </div>
+        <label class="field">
+          <span>Authorization URL</span>
+          <div class="row">
+            <input id="oauth-url" type="text" readonly>
+            <button id="oauth-open" class="button ghost small" type="button">Open</button>
+          </div>
+        </label>
+        <label class="field">
+          <span>Authorization code</span>
+          <input id="oauth-code" type="text" placeholder="Paste the code here">
+        </label>
+        <div class="row">
+          <button id="oauth-complete" class="button">Complete OAuth</button>
+          <div id="oauth-message" class="notice" role="status"></div>
+        </div>
       </div>
     </div>
   </div>

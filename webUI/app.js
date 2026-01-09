@@ -26,6 +26,12 @@ const browserState = {
   renderToken: 0,
   limit: 500,
 };
+const oauthState = {
+  open: false,
+  sessionId: null,
+  authUrl: "",
+  account: "",
+};
 const BROWSE_DEFAULTS = {
   configDir: "",
   mediaRoot: "",
@@ -137,7 +143,7 @@ function setupNavActions() {
 }
 
 function updatePollingState() {
-  state.pollingPaused = browserState.open || state.configDirty || state.inputFocused;
+  state.pollingPaused = browserState.open || oauthState.open || state.configDirty || state.inputFocused;
 }
 
 function withPollingGuard(fn) {
@@ -598,6 +604,86 @@ function applyBrowserSelection() {
   }
 }
 
+function openOauthModal() {
+  oauthState.open = true;
+  $("#oauth-modal").classList.remove("hidden");
+  updatePollingState();
+}
+
+function closeOauthModal() {
+  oauthState.open = false;
+  $("#oauth-modal").classList.add("hidden");
+  oauthState.sessionId = null;
+  oauthState.authUrl = "";
+  oauthState.account = "";
+  updatePollingState();
+}
+
+async function startOauthForRow(row) {
+  const account = row.querySelector(".account-name").value.trim();
+  const clientSecret = row.querySelector(".account-client").value.trim();
+  const tokenOut = row.querySelector(".account-token").value.trim();
+  if (!account) {
+    setConfigNotice("Account name is required for OAuth.", true);
+    return;
+  }
+  if (!clientSecret || !tokenOut) {
+    setConfigNotice("Client secret and token paths are required for OAuth.", true);
+    return;
+  }
+  try {
+    setConfigNotice("Starting OAuth...", false);
+    const data = await fetchJson("/api/oauth/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        account,
+        client_secret: clientSecret,
+        token_out: tokenOut,
+      }),
+    });
+    oauthState.sessionId = data.session_id;
+    oauthState.authUrl = data.auth_url || "";
+    oauthState.account = account;
+    $("#oauth-account").textContent = account;
+    $("#oauth-url").value = oauthState.authUrl;
+    $("#oauth-code").value = "";
+    setNotice($("#oauth-message"), "", false);
+    openOauthModal();
+    if (oauthState.authUrl) {
+      window.open(oauthState.authUrl, "_blank", "noopener");
+    }
+  } catch (err) {
+    setConfigNotice(`OAuth start failed: ${err.message}`, true);
+  }
+}
+
+async function completeOauth() {
+  const code = $("#oauth-code").value.trim();
+  if (!oauthState.sessionId) {
+    setNotice($("#oauth-message"), "No active OAuth session.", true);
+    return;
+  }
+  if (!code) {
+    setNotice($("#oauth-message"), "Authorization code is required.", true);
+    return;
+  }
+  try {
+    setNotice($("#oauth-message"), "Completing OAuth...", false);
+    await fetchJson("/api/oauth/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: oauthState.sessionId,
+        code,
+      }),
+    });
+    setNotice($("#oauth-message"), "Token saved.", false);
+  } catch (err) {
+    setNotice($("#oauth-message"), `OAuth failed: ${err.message}`, true);
+  }
+}
+
 async function refreshConfigPath() {
   try {
     const data = await fetchJson("/api/config/path");
@@ -985,13 +1071,19 @@ function addAccountRow(name = "", data = {}) {
         <button class="button ghost small browse-token" type="button">Browse</button>
       </div>
     </label>
-    <button class="button ghost remove">Remove</button>
+    <div class="account-actions">
+      <button class="button ghost small oauth-run" type="button">Run OAuth</button>
+      <button class="button ghost remove">Remove</button>
+    </div>
   `;
   row.querySelector(".remove").addEventListener("click", () => {
     if (!window.confirm("Remove this account?")) {
       return;
     }
     row.remove();
+  });
+  row.querySelector(".oauth-run").addEventListener("click", () => {
+    startOauthForRow(row);
   });
   row.querySelector(".browse-client").addEventListener("click", () => {
     const input = row.querySelector(".account-client");
@@ -1447,6 +1539,14 @@ function bindEvents() {
       $("#browser-select").disabled = false;
     }
   });
+
+  $("#oauth-close").addEventListener("click", closeOauthModal);
+  $("#oauth-open").addEventListener("click", () => {
+    if (oauthState.authUrl) {
+      window.open(oauthState.authUrl, "_blank", "noopener");
+    }
+  });
+  $("#oauth-complete").addEventListener("click", completeOauth);
 
   $("#add-account").addEventListener("click", () => addAccountRow("", {}));
   $("#add-playlist").addEventListener("click", () => addPlaylistRow({}));

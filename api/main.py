@@ -33,6 +33,7 @@ import anyio
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from google_auth_oauthlib.flow import InstalledAppFlow
 from pydantic import BaseModel
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -48,6 +49,7 @@ from engine.paths import (
     build_engine_paths,
     ensure_dir,
     resolve_config_path,
+    resolve_dir,
 )
 from engine.runtime import get_runtime_info
 
@@ -60,6 +62,10 @@ _BASIC_AUTH_PASS = os.environ.get("YT_ARCHIVER_BASIC_AUTH_PASS")
 _BASIC_AUTH_ENABLED = bool(_BASIC_AUTH_USER and _BASIC_AUTH_PASS)
 _TRUST_PROXY = os.environ.get("YT_ARCHIVER_TRUST_PROXY", "").strip().lower() in {"1", "true", "yes", "on"}
 SCHEDULE_JOB_ID = "archive_schedule"
+OAUTH_SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
+OAUTH_SESSION_TTL = timedelta(minutes=15)
+_OAUTH_SESSIONS = {}
+_OAUTH_LOCK = threading.Lock()
 
 WEBUI_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "webUI"))
 
@@ -117,6 +123,25 @@ class ScheduleRequest(BaseModel):
     mode: str | None = None
     interval_hours: int | None = None
     run_on_startup: bool | None = None
+
+
+class OAuthStartRequest(BaseModel):
+    account: str | None = None
+    client_secret: str
+    token_out: str
+
+
+class OAuthCompleteRequest(BaseModel):
+    session_id: str
+    code: str
+
+
+def _purge_oauth_sessions():
+    now = datetime.now(timezone.utc)
+    with _OAUTH_LOCK:
+        expired = [key for key, entry in _OAUTH_SESSIONS.items() if entry["expires_at"] <= now]
+        for key in expired:
+            _OAUTH_SESSIONS.pop(key, None)
 
 
 app = FastAPI(title=APP_NAME)
@@ -820,6 +845,62 @@ async def api_paths():
         "tokens_dir": TOKENS_DIR,
         "browse_roots": app.state.browse_roots,
     }
+
+
+@app.post("/api/oauth/start")
+async def api_oauth_start(payload: OAuthStartRequest):
+    _purge_oauth_sessions()
+    try:
+        client_secret_file = resolve_dir(payload.client_secret, TOKENS_DIR)
+        token_file = resolve_dir(payload.token_out, TOKENS_DIR)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    ensure_dir(TOKENS_DIR)
+    flow = InstalledAppFlow.from_client_secrets_file(client_secret_file, OAUTH_SCOPES)
+    flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
+    auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
+    session_id = uuid4().hex
+    with _OAUTH_LOCK:
+        _OAUTH_SESSIONS[session_id] = {
+            "flow": flow,
+            "token_file": token_file,
+            "account": payload.account or "",
+            "expires_at": datetime.now(timezone.utc) + OAUTH_SESSION_TTL,
+        }
+    return {"session_id": session_id, "auth_url": auth_url}
+
+
+@app.post("/api/oauth/complete")
+async def api_oauth_complete(payload: OAuthCompleteRequest):
+    _purge_oauth_sessions()
+    with _OAUTH_LOCK:
+        session = _OAUTH_SESSIONS.pop(payload.session_id, None)
+    if not session:
+        raise HTTPException(status_code=404, detail="OAuth session not found or expired")
+    code = (payload.code or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="Authorization code is required")
+    flow = session["flow"]
+    try:
+        flow.fetch_token(code=code)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"OAuth failed: {exc}") from exc
+    creds = flow.credentials
+    token_file = session["token_file"]
+    token_data = {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": creds.token_uri,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": creds.scopes,
+    }
+    ensure_dir(os.path.dirname(token_file))
+    with open(token_file, "w") as f:
+        json.dump(token_data, f, indent=2)
+    account = session.get("account") or "unknown"
+    logging.info("OAuth token saved for account %s to %s", account, token_file)
+    return {"status": "ok", "token_path": token_file}
 
 
 @app.get("/api/config/path")

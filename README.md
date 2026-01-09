@@ -56,9 +56,14 @@ Local/source deployment (optional):
 cp config/config_sample.json config/config.json
 ```
 
-2) (OPTIONAL) Create a Google Cloud OAuth client (Desktop app) and place client secret JSONs in `tokens/`.
+2) (OPTIONAL) Create a Google Cloud OAuth client (Type: Desktop app) and place client secret JSONs in `tokens/`.
 
-3) (OPTIONAL - Also available in webUI) Generate OAuth tokens:
+3) (OPTIONAL) Generate OAuth tokens:
+Web UI (recommended):
+- Config page → Accounts → fill Account, Client Secret, Token path
+- Click “Run OAuth”, open the URL, approve, then paste the code to save the token
+
+CLI fallback:
 ```bash
 python scripts/setup_oauth.py --account family_tv tokens/client_secret_family.json tokens/token_family.json
 ```
@@ -88,6 +93,7 @@ Do not put absolute host paths in `config.json` when using Docker.
 The Web UI is served by the API and talks only to REST endpoints. It provides:
 	•	Home page with run controls, status, schedule, and metrics
 	•	Config page (including schedule controls and optional playlist names)
+	•	OAuth helper to generate tokens directly from the Config page
 	•	Downloads page with search and limit controls
 	•	History page with search, filter, sort, and limit controls
 	•	Logs page with manual refresh
@@ -162,14 +168,13 @@ This project does not attempt to:
 	•	Bypass platform terms of service
 
 ## Notes
-	•	Keep config/config.json, tokens/, and the SQLite database out of version control
 	•	Downloads are staged in a temp directory and atomically copied to their final location
 	•	“Clear temporary files” only removes working directories (temp downloads + yt-dlp temp)
 	•	“Update yt-dlp” runs in-container and requires a container restart to take effect
 	•	YT_ARCHIVER_* environment variables can override paths (see .env.example)
 
 ## Release
-Current release: v1.1.0. See `CHANGELOG.md` for details.
+See `CHANGELOG.md` for details of the current release and history.
 
 ## Contributing
 Contributions are welcome. Please read `CONTRIBUTING.md` before opening a PR.
