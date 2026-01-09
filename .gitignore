@@ -1,14 +1,7 @@
-# Python / venv
-*.pyc
-
 # Local config and secrets
 .env
-
-# State / outputs
 *.sqlite
+*.pyc
 backups/
-
-# Editor / OS
-.DS_Store
 ._*
 .vscode/

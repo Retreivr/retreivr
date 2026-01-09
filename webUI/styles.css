@@ -335,6 +335,15 @@ button:disabled {
   border: 1px solid var(--accent);
 }
 
+.button.remove {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.button.remove:hover {
+  background: rgba(255, 123, 123, 0.12);
+}
+
 .button.small {
   padding: 6px 12px;
   font-size: 12px;
@@ -417,6 +426,16 @@ a[aria-disabled="true"] {
 .stat span:not(.label) {
   font-size: 14px;
   font-weight: 600;
+}
+
+.version-block {
+  align-items: flex-start;
+}
+
+.version-block .stat .meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .progress {

@@ -26,6 +26,29 @@ from engine.paths import EnginePaths, resolve_dir
 MAX_VIDEO_RETRIES = 4        # Hard cap per video
 EXTRACTOR_RETRIES = 2        # Times to retry each extractor before moving on
 
+_GOOGLE_AUTH_RETRY = re.compile(r"Refreshing credentials due to a 401 response\\. Attempt (\\d+)/(\\d+)\\.")
+
+
+def _install_google_auth_filter():
+    def _rewrite(record):
+        msg = record.getMessage()
+        match = _GOOGLE_AUTH_RETRY.search(msg)
+        if match:
+            attempt, total = match.groups()
+            record.msg = f"Signing into Google OAuth. Attempt {attempt}/{total}."
+            record.args = ()
+        return True
+
+    for logger_name in ("google.auth.transport.requests", "google.auth.credentials"):
+        logger = logging.getLogger(logger_name)
+        if getattr(logger, "_yt_archiver_filter", False):
+            continue
+        logger.addFilter(_rewrite)
+        logger._yt_archiver_filter = True
+
+
+_install_google_auth_filter()
+
 
 @dataclass
 class EngineStatus:

@@ -1,5 +1,6 @@
 # Changelog
 All notable changes to this project will be documented here.
+
 ## Prior to 1.0.0
 - no official release
 - only python scripts released, no official package
@@ -42,3 +43,11 @@ Added:
 Changed:
 - Dockerfile build arg for `YT_ARCHIVER_VERSION`.
 
+## 1.1.1 - Version Control and YT-DLP Update Maintenance
+Added:
+- prompts to verify you wish to remove items on 'Remove' button press
+
+Changed:
+- hardened version control by clearing caches.
+- better date/time format in Status block.
+- clearer log entries when Google Oauth runs to verify playlists.

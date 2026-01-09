@@ -36,6 +36,7 @@ const GITHUB_RELEASE_URL = `https://api.github.com/repos/${GITHUB_REPO}/releases
 const GITHUB_RELEASE_PAGE = "https://github.com/z3ro-2/youtube-archiver/releases";
 const RELEASE_CHECK_KEY = "yt_archiver_release_checked_at";
 const RELEASE_CACHE_KEY = "yt_archiver_release_cache";
+const RELEASE_VERSION_KEY = "yt_archiver_release_app_version";
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -389,6 +390,7 @@ function applyReleaseStatus(currentVersion, latestTag) {
 async function checkRelease(currentVersion) {
   const now = Date.now();
   const lastCheck = parseInt(localStorage.getItem(RELEASE_CHECK_KEY) || "0", 10);
+  const cachedVersion = localStorage.getItem(RELEASE_VERSION_KEY) || "";
   const cachedRaw = localStorage.getItem(RELEASE_CACHE_KEY);
   let cached = null;
   if (cachedRaw) {
@@ -399,7 +401,14 @@ async function checkRelease(currentVersion) {
     }
   }
 
-  if (lastCheck && now - lastCheck < 24 * 60 * 60 * 1000 && cached) {
+  const normalizedVersion = normalizeVersionTag(currentVersion || "");
+  const versionChanged = cachedVersion !== normalizedVersion;
+  if (versionChanged) {
+    localStorage.removeItem(RELEASE_CHECK_KEY);
+    localStorage.removeItem(RELEASE_CACHE_KEY);
+  }
+
+  if (lastCheck && now - lastCheck < 24 * 60 * 60 * 1000 && cached && !versionChanged) {
     applyReleaseStatus(currentVersion, cached.tag);
     return;
   }
@@ -413,6 +422,7 @@ async function checkRelease(currentVersion) {
     const tag = data.tag_name || "";
     localStorage.setItem(RELEASE_CHECK_KEY, String(now));
     localStorage.setItem(RELEASE_CACHE_KEY, JSON.stringify({ tag }));
+    localStorage.setItem(RELEASE_VERSION_KEY, normalizedVersion);
     applyReleaseStatus(currentVersion, tag);
   } catch (err) {
     if (cached) {
@@ -631,8 +641,8 @@ async function refreshStatus() {
     }
 
     $("#status-run-id").textContent = `run: ${data.run_id || "-"}`;
-    $("#status-started").textContent = data.started_at || "-";
-    $("#status-finished").textContent = data.finished_at || "-";
+    $("#status-started").textContent = formatTimestamp(data.started_at) || "-";
+    $("#status-finished").textContent = formatTimestamp(data.finished_at) || "-";
     $("#status-error").textContent = data.error || "-";
 
     const status = data.status || {};
@@ -977,7 +987,12 @@ function addAccountRow(name = "", data = {}) {
     </label>
     <button class="button ghost remove">Remove</button>
   `;
-  row.querySelector(".remove").addEventListener("click", () => row.remove());
+  row.querySelector(".remove").addEventListener("click", () => {
+    if (!window.confirm("Remove this account?")) {
+      return;
+    }
+    row.remove();
+  });
   row.querySelector(".browse-client").addEventListener("click", () => {
     const input = row.querySelector(".account-client");
     openBrowser(input, "tokens", "file", ".json", resolveBrowseStart("tokens", input.value));
@@ -1016,7 +1031,12 @@ function addPlaylistRow(entry = {}) {
   const separator = document.createElement("div");
   separator.className = "playlist-separator";
   row.appendChild(separator);
-  row.querySelector(".remove").addEventListener("click", () => row.remove());
+  row.querySelector(".remove").addEventListener("click", () => {
+    if (!window.confirm("Remove this playlist?")) {
+      return;
+    }
+    row.remove();
+  });
   row.querySelector(".browse-folder").addEventListener("click", () => {
     const target = row.querySelector(".playlist-folder");
     openBrowser(target, "downloads", "dir", "", resolveBrowseStart("downloads", target.value));
