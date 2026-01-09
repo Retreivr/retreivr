@@ -43,7 +43,7 @@ Added:
 Changed:
 - Dockerfile build arg for `YT_ARCHIVER_VERSION`.
 
-## 1.1.1 - Version Control and YT-DLP Update Maintenance
+## 1.1.1 - Minor Patch
 Added:
 - prompts to verify you wish to remove items on 'Remove' button press
 
@@ -51,3 +51,12 @@ Changed:
 - hardened version control by clearing caches.
 - better date/time format in Status block.
 - clearer log entries when Google Oauth runs to verify playlists.
+
+## 1.1.2 - Publish to GHCR for Easy Docker Pulls from CLI
+No changes from v1.1.1 - just creating new tag to automatically publish to GHCR repo to make docker pulls directly from there.
+
+Docker Pull Command:
+docker pull ghcr.io/z3ro-2/youtube-archiver:latest
+
+Docker Compose Line:
+image: ghcr.io/z3ro-2/youtube-archiver:latest
