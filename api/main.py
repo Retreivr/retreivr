@@ -315,19 +315,34 @@ async def startup():
     app.state.watch_policy = watch_policy
     app.state.watch_config_cache = config
     app.state.watcher_clients_cache = {}
-    if not app.state.single_worker_enforced:
-        logging.info(
-            "Watcher disabled due to guardrails (multiple workers detected=%d)",
-            app.state.worker_count,
-        )
+    enable_watcher = bool(config.get("enable_watcher")) if isinstance(config, dict) else False
+    if not enable_watcher:
         app.state.watcher_lock = None
+        app.state.watcher_task = None
+        logging.info("Watcher disabled by config; not starting")
     else:
-        app.state.watcher_lock = _acquire_watcher_lock(DATA_DIR)
-    if app.state.watcher_lock is None:
-        logging.info("Watcher disabled due to guardrails (lock unavailable)")
-    else:
-        app.state.watcher_task = asyncio.create_task(_watcher_supervisor())
-        logging.info("Watcher active — adaptive monitoring enabled")
+        if not app.state.single_worker_enforced:
+            logging.info(
+                "Watcher disabled due to guardrails (multiple workers detected=%d)",
+                app.state.worker_count,
+            )
+            app.state.watcher_lock = None
+        else:
+            app.state.watcher_lock = _acquire_watcher_lock(DATA_DIR)
+        if app.state.watcher_lock is None:
+            logging.info("Watcher disabled due to guardrails (lock unavailable)")
+        else:
+            app.state.watcher_task = asyncio.create_task(_watcher_supervisor())
+            logging.info("Watcher active — adaptive monitoring enabled")
+
+    app.state.watcher_status = {
+        "state": "disabled" if app.state.watcher_lock is None else "idle",
+        "last_poll_ts": None,
+        "next_poll_ts": None,
+        "pending_playlists_count": 0,
+        "quiet_window_remaining_sec": None,
+        "batch_active": False,
+    }
 
     downtime_active, _ = _check_downtime(config or {})
     logging.info(
@@ -1589,6 +1604,9 @@ async def _poll_single_playlist(config, now, policy, pl, watch, yt_clients, batc
 async def _watcher_supervisor():
     # Watcher = adaptive per-playlist monitoring that triggers runs when changes are detected.
     logging.info("Watcher started")
+    _set_watcher_status("idle")
+    startup_logged = False
+    last_candidate_state = None
     batch_state = {
         "pending_playlists": set(),
         "last_detection_ts": None,
@@ -1596,9 +1614,11 @@ async def _watcher_supervisor():
     }
     while True:
         if getattr(app.state, "watcher_lock", None) is None:
+            _set_watcher_status("disabled", batch_active=False, pending_playlists_count=0, quiet_window_remaining_sec=None)
             return
         config = _read_config_for_watcher()
         if not config:
+            _set_watcher_status("idle", next_poll_ts=None, pending_playlists_count=0, quiet_window_remaining_sec=None, batch_active=False)
             await asyncio.sleep(60)
             continue
 
@@ -1608,6 +1628,7 @@ async def _watcher_supervisor():
         tzinfo = _resolve_timezone(downtime.get("timezone"), local_now.tzinfo)
         now = local_now.astimezone(tzinfo)
 
+        downtime_active = False
         if downtime.get("enabled"):
             downtime_active, _next_allowed = in_downtime(
                 now,
@@ -1623,6 +1644,22 @@ async def _watcher_supervisor():
 
         playlists = config.get("playlists") or []
         if not playlists:
+            if last_candidate_state != "no_playlists":
+                logging.info("Watcher: no candidates (playlists=0)")
+                last_candidate_state = "no_playlists"
+            if not startup_logged:
+                logging.info(
+                    "Watcher startup diag: playlists=0 downtime_enabled=%s downtime_active=%s "
+                    "timezone=%s next_poll_at=%s delta_sec=%s lock=%s",
+                    bool(downtime.get("enabled")),
+                    bool(downtime_active),
+                    downtime.get("timezone") or "local",
+                    None,
+                    None,
+                    bool(getattr(app.state, "watcher_lock", None)),
+                )
+                startup_logged = True
+            _set_watcher_status("idle", next_poll_ts=None, pending_playlists_count=0, quiet_window_remaining_sec=None, batch_active=False)
             await asyncio.sleep(60)
             continue
         playlist_map = {}
@@ -1633,10 +1670,23 @@ async def _watcher_supervisor():
             playlist_id = extract_playlist_id(playlist_key) or playlist_key
             playlist_map[playlist_id] = pl
 
-        if (batch_state["pending_playlists"] and batch_state["last_detection_ts"] is not None
+        pending_count = len(batch_state["pending_playlists"])
+        quiet_remaining = None
+        if batch_state["last_detection_ts"] is not None and not batch_state["batch_active"]:
+            quiet_remaining = max(
+                0,
+                int(WATCHER_QUIET_WINDOW_SECONDS - (time.monotonic() - batch_state["last_detection_ts"])),
+            )
+        if (pending_count and batch_state["last_detection_ts"] is not None
                 and not batch_state["batch_active"]):
             elapsed = time.monotonic() - batch_state["last_detection_ts"]
             if elapsed >= WATCHER_QUIET_WINDOW_SECONDS:
+                _set_watcher_status(
+                    "batch_ready",
+                    pending_playlists_count=pending_count,
+                    quiet_window_remaining_sec=0,
+                    batch_active=False,
+                )
                 logging.info(
                     "Watcher: quiet window elapsed (%ss), preparing batch run",
                     WATCHER_QUIET_WINDOW_SECONDS,
@@ -1644,6 +1694,12 @@ async def _watcher_supervisor():
                 batch_state["batch_active"] = True
                 batch_playlists = list(batch_state["pending_playlists"])
                 batch_state["pending_playlists"].clear()
+                _set_watcher_status(
+                    "running_batch",
+                    pending_playlists_count=len(batch_playlists),
+                    quiet_window_remaining_sec=None,
+                    batch_active=True,
+                )
                 logging.info(
                     "Watcher: starting batch run playlists=%s",
                     ",".join(batch_playlists),
@@ -1696,8 +1752,17 @@ async def _watcher_supervisor():
                     telegram_notify(config, msg)
                 batch_state["batch_active"] = False
                 batch_state["last_detection_ts"] = None
+                _set_watcher_status("idle", pending_playlists_count=0, quiet_window_remaining_sec=None, batch_active=False)
                 logging.info("Watcher: batch state reset, resuming monitoring")
                 continue
+            _set_watcher_status(
+                "waiting_quiet_window",
+                pending_playlists_count=pending_count,
+                quiet_window_remaining_sec=quiet_remaining,
+                batch_active=False,
+            )
+        else:
+            _set_watcher_status("idle", pending_playlists_count=pending_count, quiet_window_remaining_sec=None, batch_active=batch_state["batch_active"])
 
         if downtime.get("enabled") and downtime_active:
             await asyncio.sleep(60)
@@ -1739,11 +1804,79 @@ async def _watcher_supervisor():
             candidates.append((next_poll_at, pl, watch))
 
         if not candidates:
+            if last_candidate_state != "no_watch_state":
+                logging.info("Watcher: no candidates (watch_state=0)")
+                last_candidate_state = "no_watch_state"
+            if not startup_logged:
+                logging.info(
+                    "Watcher startup diag: playlists=%s downtime_enabled=%s downtime_active=%s "
+                    "timezone=%s next_poll_at=%s delta_sec=%s lock=%s",
+                    len(playlists),
+                    bool(downtime.get("enabled")),
+                    bool(downtime_active),
+                    downtime.get("timezone") or "local",
+                    None,
+                    None,
+                    bool(getattr(app.state, "watcher_lock", None)),
+                )
+                startup_logged = True
             await asyncio.sleep(60)
             continue
 
         candidates.sort(key=lambda item: item[0])
         next_poll_at, pl, watch = candidates[0]
+        if last_candidate_state != "available":
+            logging.info("Watcher: candidates available")
+            last_candidate_state = "available"
+        delta_seconds = int((next_poll_at - now).total_seconds())
+        if not startup_logged:
+            logging.info(
+                "Watcher startup diag: playlists=%s downtime_enabled=%s downtime_active=%s "
+                "timezone=%s next_poll_at=%s delta_sec=%s lock=%s",
+                len(playlists),
+                bool(downtime.get("enabled")),
+                bool(downtime_active),
+                downtime.get("timezone") or "local",
+                _format_iso(next_poll_at),
+                delta_seconds,
+                bool(getattr(app.state, "watcher_lock", None)),
+            )
+            startup_logged = True
+        min_interval_minutes = policy.get("min_interval_minutes") or 5
+        interval_seconds = max(60, int(min_interval_minutes * 60))
+        max_sleep_seconds = max(interval_seconds * 3, 900)
+        if delta_seconds > max_sleep_seconds:
+            clamped = now + timedelta(seconds=min(30, interval_seconds))
+            logging.warning(
+                "Watcher: next_poll_at skew detected; clamping from %s to %s (delta=%s)",
+                _format_iso(next_poll_at),
+                _format_iso(clamped),
+                delta_seconds,
+            )
+            playlist_key = pl.get("playlist_id") or pl.get("id")
+            playlist_id = extract_playlist_id(playlist_key) or playlist_key
+            consecutive_no_change = watch.get("consecutive_no_change") or 0
+            current_interval = watch.get("current_interval_min")
+            if not isinstance(current_interval, int):
+                current_interval = min_interval_minutes
+            _write_watch_state(
+                app.state.paths.db_path,
+                playlist_id,
+                last_checked_at=watch.get("last_checked_at"),
+                next_poll_at=_format_iso(clamped),
+                idle_count=watch.get("idle_count") or 0,
+                current_interval_min=current_interval,
+                consecutive_no_change=consecutive_no_change,
+                last_change_at=watch.get("last_change_at"),
+                skip_reason=watch.get("skip_reason"),
+                last_error=watch.get("last_error"),
+                last_error_at=watch.get("last_error_at"),
+            )
+            next_poll_at = clamped
+        _set_watcher_status(
+            state=getattr(app.state, "watcher_status", {}).get("state") or "idle",
+            next_poll_ts=_format_iso(next_poll_at),
+        )
         if now < next_poll_at:
             sleep_seconds = max(0.0, (next_poll_at - now).total_seconds())
             if (batch_state["pending_playlists"] and batch_state["last_detection_ts"] is not None
@@ -1769,7 +1902,38 @@ async def _watcher_supervisor():
             if accounts
             else {}
         )
+        pending_before = len(batch_state["pending_playlists"])
+        _set_watcher_status(
+            "polling",
+            last_poll_ts=_format_iso(now),
+            pending_playlists_count=pending_before,
+            quiet_window_remaining_sec=None,
+            batch_active=batch_state["batch_active"],
+        )
         await _poll_single_playlist(config, now, policy, pl, watch, yt_clients, batch_state)
+        pending_after = len(batch_state["pending_playlists"])
+        if pending_after > pending_before:
+            logging.info("Watcher poll complete: updates detected")
+        else:
+            logging.info("Watcher poll complete: no updates detected")
+        if batch_state["last_detection_ts"] is not None and not batch_state["batch_active"]:
+            quiet_remaining = max(
+                0,
+                int(WATCHER_QUIET_WINDOW_SECONDS - (time.monotonic() - batch_state["last_detection_ts"])),
+            )
+            _set_watcher_status(
+                "waiting_quiet_window",
+                pending_playlists_count=pending_after,
+                quiet_window_remaining_sec=quiet_remaining,
+                batch_active=False,
+            )
+        else:
+            _set_watcher_status(
+                "idle",
+                pending_playlists_count=pending_after,
+                quiet_window_remaining_sec=None,
+                batch_active=batch_state["batch_active"],
+            )
 
 
 def _apply_watch_policy(policy):
@@ -1777,6 +1941,36 @@ def _apply_watch_policy(policy):
         return
     # Supervisor loop reads watch_policy each iteration.
     app.state.watch_policy = policy
+
+
+def _set_watcher_status(state=None, **fields):
+    status = getattr(app.state, "watcher_status", None)
+    if status is None:
+        status = {}
+        app.state.watcher_status = status
+    prev_state = status.get("state")
+    if state and state != prev_state:
+        status["state"] = state
+        if state == "polling":
+            logging.info("Watcher state → polling")
+        elif state == "waiting_quiet_window":
+            remaining = fields.get("quiet_window_remaining_sec")
+            if remaining is None:
+                remaining = WATCHER_QUIET_WINDOW_SECONDS
+            logging.info("Watcher state → waiting_quiet_window (%ss)", remaining)
+        elif state == "batch_ready":
+            logging.info("Watcher state → batch_ready")
+        elif state == "running_batch":
+            count = fields.get("pending_playlists_count")
+            if count is None:
+                count = 0
+            logging.info("Watcher state → running_batch playlists=%s", count)
+        elif state == "disabled":
+            logging.info("Watcher state → disabled")
+        else:
+            logging.info("Watcher state → %s", state)
+    for key, value in fields.items():
+        status[key] = value
 
 
 @app.get("/api/status")
@@ -1805,6 +1999,9 @@ async def api_status():
     paused = False
     if watcher_downtime.get("enabled"):
         paused, _ = in_downtime(now, watcher_downtime.get("start"), watcher_downtime.get("end"))
+    watcher_status = dict(getattr(app.state, "watcher_status", {}) or {})
+    if not bool(getattr(app.state, "watcher_lock", None)):
+        watcher_status["state"] = "disabled"
     return {
         "schema_version": STATUS_SCHEMA_VERSION,
         "server_time": datetime.now(timezone.utc).isoformat(),
@@ -1818,6 +2015,7 @@ async def api_status():
             "enabled": bool(getattr(app.state, "watcher_lock", None)),
             "paused": bool(paused),
         },
+        "watcher_status": watcher_status,
         "scheduler": {
             "enabled": bool((app.state.schedule_config or {}).get("enabled", False)),
         },

@@ -182,6 +182,15 @@ function formatDuration(seconds) {
   return `${secs}s`;
 }
 
+function formatCountdown(serverTime, targetTime) {
+  if (!serverTime || !targetTime) return "";
+  const now = new Date(serverTime).getTime();
+  const target = new Date(targetTime).getTime();
+  if (Number.isNaN(now) || Number.isNaN(target)) return "";
+  const diff = Math.max(0, Math.floor((target - now) / 1000));
+  return formatDuration(diff);
+}
+
 function normalizeVersionTag(tag) {
   if (!tag) return "";
   return tag.trim().replace(/^v/i, "");
@@ -764,6 +773,37 @@ async function refreshStatus() {
     $("#status-playlist").textContent = status.current_playlist_id || "-";
     $("#status-video").textContent = status.current_video_title || status.current_video_id || "-";
     $("#status-phase").textContent = status.current_phase || "-";
+    const watcherStatus = data.watcher_status || {};
+    const watcherStateMap = {
+      idle: "Idle",
+      polling: "Polling",
+      waiting_quiet_window: "Waiting (quiet window)",
+      batch_ready: "Batch ready",
+      running_batch: "Running batch",
+      disabled: "Disabled",
+    };
+    const watcherState = watcherStatus.state || (watcher.enabled ? "idle" : "disabled");
+    $("#watcher-state").textContent = watcherStateMap[watcherState] || watcherState;
+    const pendingCount = Number.isFinite(watcherStatus.pending_playlists_count)
+      ? watcherStatus.pending_playlists_count
+      : 0;
+    $("#watcher-pending").textContent = String(pendingCount);
+    $("#watcher-batch").textContent = watcherStatus.batch_active ? "Active" : "Inactive";
+    $("#watcher-last-poll").textContent = watcherStatus.last_poll_ts
+      ? formatTimestamp(watcherStatus.last_poll_ts)
+      : "-";
+    if (watcherStatus.next_poll_ts) {
+      const countdown = formatCountdown(data.server_time, watcherStatus.next_poll_ts);
+      const suffix = countdown ? ` (in ${countdown})` : "";
+      $("#watcher-next-poll").textContent = `${formatTimestamp(watcherStatus.next_poll_ts)}${suffix}`;
+    } else {
+      $("#watcher-next-poll").textContent = "-";
+    }
+    if (Number.isFinite(watcherStatus.quiet_window_remaining_sec)) {
+      $("#watcher-quiet-remaining").textContent = formatDuration(watcherStatus.quiet_window_remaining_sec);
+    } else {
+      $("#watcher-quiet-remaining").textContent = "-";
+    }
     if (status.last_completed) {
       const suffix = status.last_completed_at ? ` (${formatTimestamp(status.last_completed_at)})` : "";
       $("#status-last-completed").textContent = `${status.last_completed}${suffix}`;
