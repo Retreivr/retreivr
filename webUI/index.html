@@ -6,8 +6,8 @@
   <title>YouTube Archiver</title>
   <link rel="icon" href="app_icon.png" type="image/png">
   <link rel="apple-touch-icon" href="app_icon.png">
-  <link rel="stylesheet" href="styles.css?v=1.2.0">
-  <script defer src="app.js?v=1.2.0"></script>
+  <link rel="stylesheet" href="styles.css?v=1.3.0">
+  <script defer src="app.js?v=1.3.0"></script>
 </head>
 <body>
   <div class="backdrop"></div>
@@ -50,19 +50,32 @@
 
         <div class="group">
           <div class="group-title">Single URL</div>
-          <label class="field">
+          <label class="field long">
             <span>Video URL</span>
             <input id="run-single-url" type="text" placeholder="https://www.youtube.com/watch?v=...">
           </label>
-        <label class="field">
-          <span>Destination</span>
-          <div class="row">
-            <input id="run-destination" type="text" placeholder="downloads">
-            <button id="browse-run-destination" class="button ghost small" type="button">Browse</button>
-          </div>
-        </label>
+          <label class="field long gap-top">
+            <span>Delivery</span>
+            <div class="row delivery-options">
+              <label class="radio">
+                <input type="radio" name="run-delivery-mode" value="server" checked>
+                <span>Save to server library</span>
+              </label>
+              <label class="radio">
+                <input type="radio" name="run-delivery-mode" value="client">
+                <span>Download to this device</span>
+              </label>
+            </div>
+          </label>
+          <label class="field medium gap-top">
+            <span id="run-destination-label">Destination (single runs)</span>
+            <div class="row">
+              <input id="run-destination" type="text" placeholder="downloads">
+              <button id="browse-run-destination" class="button ghost small" type="button">Browse</button>
+            </div>
+          </label>
         <div class="row">
-          <label class="field">
+          <label class="field short">
             <span>Format override</span>
             <select id="run-format">
               <option value="">(config default)</option>
@@ -72,9 +85,13 @@
               <option value="mp3">mp3</option>
             </select>
           </label>
-          <label class="field">
+          <label class="field medium">
             <span>JS runtime override</span>
             <input id="run-js-runtime" type="text" placeholder="node:/usr/bin/node">
+          </label>
+          <label class="field inline short">
+            <span>Music mode</span>
+            <input id="run-music-mode" type="checkbox">
           </label>
           </div>
         <div class="row">
@@ -82,6 +99,22 @@
           <a id="run-single-download" class="button ghost small" href="#" aria-disabled="true">Download last</a>
         </div>
       </div>
+
+        <div class="group">
+          <div class="group-title">Single Playlist</div>
+          <label class="field long">
+            <span>Playlist URL or ID</span>
+            <input id="run-playlist-id" type="text" placeholder="https://www.youtube.com/playlist?list=...">
+          </label>
+          <label class="field short gap-top">
+            <span>Account (optional)</span>
+            <input id="run-playlist-account" type="text" placeholder="account name from config">
+          </label>
+          <div class="row">
+            <button id="run-playlist-once" class="button">Run Playlist Once</button>
+          </div>
+          <div class="notice">Uses the same destination and format overrides as single URL runs.</div>
+        </div>
 
         <div id="run-message" class="notice" role="status"></div>
       </div>
@@ -116,12 +149,28 @@
         </div>
         <div class="row">
           <div class="stat">
+            <span class="label">Watcher</span>
+            <span id="status-watcher">-</span>
+          </div>
+          <div class="stat">
+            <span class="label">Scheduler</span>
+            <span id="status-scheduler">-</span>
+          </div>
+        </div>
+        <div class="row">
+          <div class="stat">
             <span class="label">Active playlist</span>
             <span id="status-playlist">-</span>
           </div>
           <div class="stat">
             <span class="label">Active video</span>
             <span id="status-video">-</span>
+          </div>
+        </div>
+        <div class="row">
+          <div class="stat">
+            <span class="label">Phase</span>
+            <span id="status-phase">-</span>
           </div>
         </div>
         <div class="row">
@@ -153,32 +202,21 @@
           <span class="label">Last error</span>
           <span id="status-error" class="meta">-</span>
         </div>
-        <div class="row version-block">
-          <div class="stat">
-            <span class="label">Version</span>
-            <div class="meta">
-              <div id="status-version-app">App -</div>
-              <div id="status-version-ytdlp">yt-dlp -</div>
-              <div id="status-version-python">Py -</div>
-            </div>
-          </div>
-          <div class="stat">
-            <span class="label">Update</span>
-            <span id="status-update" class="meta">-</span>
-          </div>
+        <div class="row">
+          <button id="status-cancel" class="button remove small" type="button">Kill downloads in progress</button>
         </div>
       </div>
     </section>
 
-    <section class="panel" id="schedule-panel" data-page="home">
-      <div class="panel-title">Schedule</div>
+    <section class="panel subtle" id="schedule-panel" data-page="home">
+      <div class="panel-title">Optional bulk run scheduler</div>
       <div class="stack">
         <div class="row">
           <label class="field inline">
             <span>Enabled</span>
             <input id="schedule-enabled" type="checkbox">
           </label>
-          <label class="field inline">
+          <label class="field inline short">
             <span>Interval (hours)</span>
             <input id="schedule-interval" type="number" min="1" step="1" value="6">
           </label>
@@ -202,32 +240,52 @@
             <span id="schedule-next-run">-</span>
           </div>
         </div>
+        <div class="notice">Runs full playlist jobs on a fixed interval. Not required when watcher is enabled.</div>
+        <div id="schedule-watcher-note" class="notice" style="display: none;">Watcher is active. Scheduler is optional and usually unnecessary.</div>
         <div class="notice">Scheduled runs will not interrupt or overlap manual runs.</div>
       </div>
     </section>
 
     <section class="panel" id="metrics-panel" data-page="home">
       <div class="panel-title">Metrics</div>
-      <div class="row">
-        <div class="stat">
-          <span class="label">Downloads files</span>
-          <span id="metrics-downloads-count">-</span>
+      <div class="panel-body">
+        <div class="row">
+          <div class="stat">
+            <span class="label">Downloads files</span>
+            <span id="metrics-downloads-count">-</span>
+          </div>
+          <div class="stat">
+            <span class="label">Downloads size</span>
+            <span id="metrics-downloads-size">-</span>
+          </div>
+          <div class="stat">
+            <span class="label">Disk free</span>
+            <span id="metrics-disk-free">-</span>
+          </div>
+          <div class="stat">
+            <span class="label">Disk total</span>
+            <span id="metrics-disk-total">-</span>
+          </div>
         </div>
-        <div class="stat">
-          <span class="label">Downloads size</span>
-          <span id="metrics-downloads-size">-</span>
-        </div>
-        <div class="stat">
-          <span class="label">Disk free</span>
-          <span id="metrics-disk-free">-</span>
-        </div>
-        <div class="stat">
-          <span class="label">Disk total</span>
-          <span id="metrics-disk-total">-</span>
+        <div class="row">
+          <span id="metrics-message" class="notice"></span>
         </div>
       </div>
-      <div class="row">
-        <span id="metrics-message" class="notice"></span>
+      <div class="panel-footer">
+        <div class="row version-block">
+          <div class="stat">
+            <span class="label">Version</span>
+            <div class="meta">
+              <div id="status-version-app">App -</div>
+              <div id="status-version-ytdlp">yt-dlp -</div>
+              <div id="status-version-python">Py -</div>
+            </div>
+          </div>
+          <div class="stat">
+            <span class="label">Update</span>
+            <span id="status-update" class="meta">-</span>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -237,7 +295,7 @@
         <div class="group">
           <div class="group-title">Config File</div>
           <div class="row">
-            <label class="field">
+            <label class="field long">
               <span>Config path (server)</span>
               <input id="config-path" type="text" placeholder="config/config.json">
             </label>
@@ -250,20 +308,15 @@
         <div class="group">
           <div class="group-title">General</div>
           <div class="grid two">
-            <label class="field">
-              <span>Playlist check interval (minutes)</span>
-              <input id="cfg-poll-interval" type="number" min="1" step="1">
-              <div class="notice">Checks YouTube playlists for new items (not UI refresh timing).</div>
-            </label>
-            <label class="field">
+            <label class="field short">
               <span>Upload date format</span>
               <input id="cfg-upload-date-format" type="text" placeholder="MM-YYYY">
             </label>
-            <label class="field">
+            <label class="field full">
               <span>Filename template</span>
               <input id="cfg-filename-template" type="text" placeholder="%(title)s - %(uploader)s - %(upload_date)s.%(ext)s">
             </label>
-            <label class="field">
+            <label class="field short">
               <span>Final format</span>
               <select id="cfg-final-format">
                 <option value="">(not set)</option>
@@ -273,11 +326,11 @@
                 <option value="mp3">mp3</option>
               </select>
             </label>
-            <label class="field">
+            <label class="field medium">
               <span>JS runtime</span>
               <input id="cfg-js-runtime" type="text" placeholder="node:/usr/bin/node">
             </label>
-            <label class="field">
+            <label class="field medium">
               <span>Single download folder</span>
               <div class="row">
                 <input id="cfg-single-download-folder" type="text" placeholder="downloads">
@@ -288,20 +341,81 @@
         </div>
 
         <div class="group">
+          <div class="group-title">Watcher</div>
+          <div class="grid two">
+            <label class="field inline short">
+              <span>Enabled</span>
+              <input id="cfg-watcher-enabled" type="checkbox">
+            </label>
+            <label class="field short">
+              <span>Min interval (minutes)</span>
+              <input id="cfg-watcher-min-interval" type="number" min="1" step="1">
+            </label>
+            <label class="field short">
+              <span>Max interval (minutes)</span>
+              <input id="cfg-watcher-max-interval" type="number" min="1" step="1">
+            </label>
+            <label class="field short">
+              <span>Idle backoff factor</span>
+              <input id="cfg-watcher-idle-backoff" type="number" min="1" step="1">
+            </label>
+            <label class="field short">
+              <span>Active reset (minutes)</span>
+              <input id="cfg-watcher-active-reset" type="number" min="1" step="1">
+            </label>
+            <label class="field inline short">
+              <span>Downtime enabled</span>
+              <input id="cfg-watcher-downtime-enabled" type="checkbox">
+            </label>
+            <label class="field short">
+              <span>Downtime start (HH:MM)</span>
+              <input id="cfg-watcher-downtime-start" type="text" placeholder="23:00">
+            </label>
+            <label class="field short">
+              <span>Downtime end (HH:MM)</span>
+              <input id="cfg-watcher-downtime-end" type="text" placeholder="09:00">
+            </label>
+            <label class="field medium">
+              <span>Downtime timezone</span>
+              <input id="cfg-watcher-downtime-timezone" type="text" placeholder="local">
+            </label>
+          </div>
+          <div class="notice">Automatically monitors playlists and downloads new videos as they appear.</div>
+        </div>
+
+        <div class="group">
           <div class="group-title">Telegram</div>
           <div class="grid two">
-            <label class="field">
+            <label class="field long">
               <span>Bot token</span>
               <div class="row">
                 <input id="cfg-telegram-token" type="password">
                 <button id="toggle-telegram-token" class="button ghost small" type="button">Show</button>
               </div>
             </label>
-            <label class="field">
+            <label class="field short">
               <span>Chat ID</span>
               <input id="cfg-telegram-chat" type="text">
             </label>
           </div>
+        </div>
+
+        <div class="group">
+          <div class="group-title">Music</div>
+          <div class="grid two">
+            <label class="field full">
+              <span>Music filename template</span>
+              <input id="cfg-music-template" type="text" placeholder="%(artist)s/%(album)s/%(track_number)s - %(track)s.%(ext)s">
+            </label>
+            <label class="field long">
+              <span>yt-dlp cookies (optional)</span>
+              <div class="row">
+                <input id="cfg-yt-dlp-cookies" type="text" placeholder="tokens/cookies.txt">
+                <button id="browse-yt-dlp-cookies" class="button ghost small" type="button">Browse</button>
+              </div>
+            </label>
+          </div>
+          <div class="notice">Cookies are optional but strongly recommended for YouTube Music metadata.</div>
         </div>
 
         <div class="group">
@@ -318,7 +432,7 @@
 
         <div class="group">
           <div class="group-title">yt-dlp Options (JSON)</div>
-          <label class="field">
+          <label class="field full">
             <span>Options</span>
             <textarea id="cfg-yt-dlp-opts" rows="6" placeholder='{"format_sort": ["res", "codec"]}'></textarea>
           </label>
@@ -343,7 +457,7 @@
     <section class="panel full page-full" id="logs-panel" data-page="logs">
       <div class="panel-title">Logs</div>
       <div class="row">
-        <label class="field inline">
+        <label class="field inline short">
           <span>Lines</span>
           <input id="logs-lines" type="number" min="1" max="5000" value="200">
         </label>
@@ -368,11 +482,11 @@
       </div>
       <div class="filters-block" id="downloads-filters">
         <div class="row filters">
-          <label class="field inline">
+          <label class="field inline long">
             <span>Search</span>
             <input id="downloads-search" type="text" placeholder="name or path">
           </label>
-          <label class="field inline">
+          <label class="field inline short">
             <span>Limit</span>
             <input id="downloads-limit" type="number" min="1" max="5000" value="50">
           </label>
@@ -403,29 +517,29 @@
       </div>
       <div class="filters-block" id="history-filters">
         <div class="row filters">
-          <label class="field inline">
+          <label class="field inline long">
             <span>Search</span>
             <input id="history-search" type="text" placeholder="title or filename">
           </label>
-          <label class="field inline">
+          <label class="field inline medium">
             <span>Playlist</span>
             <input id="history-playlist" type="text" placeholder="playlist id">
           </label>
-          <label class="field inline">
+          <label class="field inline short">
             <span>From</span>
             <input id="history-from" type="date">
           </label>
-          <label class="field inline">
+          <label class="field inline short">
             <span>To</span>
             <input id="history-to" type="date">
           </label>
         </div>
         <div class="row filters">
-          <label class="field inline">
+          <label class="field inline short">
             <span>Limit</span>
             <input id="history-limit" type="number" min="1" max="5000" value="50">
           </label>
-          <label class="field inline">
+          <label class="field inline short">
             <span>Sort</span>
             <select id="history-sort">
               <option value="date">date</option>
@@ -433,14 +547,14 @@
               <option value="size">size</option>
             </select>
           </label>
-          <label class="field inline">
+          <label class="field inline short">
             <span>Dir</span>
             <select id="history-dir">
               <option value="desc">desc</option>
               <option value="asc">asc</option>
             </select>
           </label>
-          <label class="field inline">
+          <label class="field inline short">
             <span>Internal paths</span>
             <input id="history-show-paths" type="checkbox">
           </label>
@@ -496,14 +610,14 @@
           <span class="label">Account</span>
           <span id="oauth-account" class="meta">-</span>
         </div>
-        <label class="field">
+        <label class="field long">
           <span>Authorization URL</span>
           <div class="row">
             <input id="oauth-url" type="text" readonly>
             <button id="oauth-open" class="button ghost small" type="button">Open</button>
           </div>
         </label>
-        <label class="field">
+        <label class="field medium">
           <span>Authorization code</span>
           <input id="oauth-code" type="text" placeholder="Paste the code here">
         </label>

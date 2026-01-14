@@ -6,7 +6,7 @@ It’s designed to run unattended, keep history in a local SQLite database, and 
 
 This is not a cloud service and it does not require any hosted components.
 
-What it’s good at
+What this tool does well
 	•	Keeping personal or shared YouTube playlists in sync
 	•	Running scheduled archive jobs without cron or babysitting
 	•	Downloading a single URL on demand
@@ -56,6 +56,10 @@ Local/source deployment (optional):
 cp config/config_sample.json config/config.json
 ```
 
+Config path usage:
+- Web UI / API runs use the server’s active config path (`/api/config/path`, default `config/config.json`).
+- CLI runs use the path passed to `scripts/archiver.py` (or its default if omitted).
+
 2) (OPTIONAL) Create a Google Cloud OAuth client (Type: Desktop app) and place client secret JSONs in `tokens/`.
 
 3) (OPTIONAL) Generate OAuth tokens:
@@ -70,12 +74,51 @@ python scripts/setup_oauth.py --account family_tv tokens/client_secret_family.js
 
 4) Edit `config/config.json`:
 - `accounts` paths to client_secret and token JSONs (optional if you only use public playlists)
-- `playlists` with `playlist_id`, `folder`, optional `account`, optional `final_format`
+- `playlists` with `playlist_id`, `folder`, optional `account`, optional `final_format`, optional `music_mode`, optional `mode` (full/subscribe)
 - `final_format` default (webm/mp4/mkv/mp3)
+- `music_filename_template` optional music-safe naming (artist/album/track)
+- `yt_dlp_cookies` optional Netscape cookies.txt for improved music metadata
 - `js_runtime` to avoid extractor issues (node:/path or deno:/path)
 - `single_download_folder` default for single-URL downloads
 - `telegram` optional bot_token/chat_id for summaries (see Telegram setup below)
 - `schedule` optional interval scheduler
+- `watch_policy` optional adaptive watcher with downtime window (local time)
+
+## Watcher (optional)
+The watcher polls playlists using the YouTube Data API and adapts its interval based on activity. Detections are batched using a quiet-window strategy (60 seconds of no new detections), then the watcher runs all queued playlists back-to-back. When downtime is active, polling pauses but queued downloads can still run.
+
+## Music mode (optional)
+Music mode is opt-in per playlist and per single-URL run. It applies music-focused metadata and uses yt-dlp music metadata when available. When enabled, download URLs use `music.youtube.com`.
+
+Recommendations:
+- Provide a Netscape `cookies.txt` file via `yt_dlp_cookies` (stored under `tokens/`) for the best YouTube Music metadata.
+- Use a music filename template such as:
+  `%(artist)s/%(album)s/%(track_number)s - %(track)s.%(ext)s`
+
+Notes:
+- If cookies are missing, music metadata quality may be degraded.
+- Single-URL runs auto-enable music mode when the URL is `music.youtube.com`.
+- If `final_format` is a video format (webm/mp4/mkv), the download remains video even in music mode. Use an audio format (mp3/m4a/flac/opus) to force audio-only.
+
+## Single-URL delivery modes
+Single-URL runs support an explicit delivery mode:
+- `server` (default): save into the server library (`single_download_folder`).
+- `client`: stage the finalized file for a one-time HTTP download to the browser, then delete it after transfer or timeout (~10 minutes).
+
+Delivery mode applies to single-URL runs only; playlists and watcher runs always save to the server library. Validation and conversion still occur before any delivery.
+
+## Subscribe mode (optional)
+Subscribe mode is opt-in per playlist and only downloads new videos after the first run.
+
+Behavior:
+- First run: records all current video IDs as seen and downloads nothing.
+- Subsequent runs: downloads only videos not already seen for that playlist.
+
+Mode interaction:
+- subscribe + music_mode → allowed
+- subscribe + video → allowed
+- full + music_mode → allowed
+Subscribe logic is orthogonal to media type.
 
 ## Path strategy (Docker)
 The app always writes to `/downloads`. You control where that maps on your system.
@@ -98,10 +141,14 @@ The Web UI is served by the API and talks only to REST endpoints. It provides:
 	•	History page with search, filter, sort, and limit controls
 	•	Logs page with manual refresh
 	•	Live playlist progress + per-video download progress
+	•	Current phase and last error in Status
 	•	App version + update availability (GitHub release check)
 	•	Download buttons for completed files
+	•	Single-URL delivery mode (server library or one-time client download)
 	•	Manual cleanup for temporary files
 	•	Manual yt-dlp update button (restart container after update)
+	•	Single-playlist runs on demand (without editing config)
+	•	Kill downloads in progress (cancel active run)
 
 ## API overview
 Common endpoints:
@@ -159,19 +206,29 @@ This avoids keeping the version in Compose or runtime envs.
 	•	No secrets exposed to frontend JavaScript
 	•	OAuth tokens are stored locally and transparently under TOKENS_DIR
 
-## Non-goals
+## What this tool does not attempt to do
 This project does not attempt to:
 	•	Circumvent DRM
 	•	Auto-update yt-dlp at runtime
 	•	Act as a hosted or cloud service
 	•	Collect telemetry or usage data
 	•	Bypass platform terms of service
+	•	Provide real-time detection (playlist checks are scheduled/polled)
+	•	Run with multiple API workers (single-worker design is required for the watcher)
+	•	Guarantee complete music metadata (fields may be missing depending on source and cookies)
 
 ## Notes
 	•	Downloads are staged in a temp directory and atomically copied to their final location
 	•	“Clear temporary files” only removes working directories (temp downloads + yt-dlp temp)
 	•	“Update yt-dlp” runs in-container and requires a container restart to take effect
 	•	YT_ARCHIVER_* environment variables can override paths (see .env.example)
+
+## Download execution model
+Downloads use a two-phase model:
+	•	Native (v1.2.0-equivalent semantics) first: a single yt-dlp invocation with explicit Node.js runtime and remote JS solver enabled to expose muxed video formats.
+	•	Hardened fallback (v1.3.0): only used if native fails, with the existing client forcing, retry ladder, and safety guards.
+Native success requires a muxed video output. Audio-only outputs are rejected and trigger fallback.
+Guiding principle: “If yt-dlp CLI succeeds with no flags, the app should succeed with no retries.”
 
 ## Release
 See `CHANGELOG.md` for details of the current release and history.

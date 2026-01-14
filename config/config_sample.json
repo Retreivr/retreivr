@@ -1,10 +1,21 @@
 {
-  "poll_interval_minutes": 30,
   "schedule": {
     "enabled": false,
     "mode": "interval",
     "interval_hours": 6,
     "run_on_startup": false
+  },
+  "watch_policy": {
+    "min_interval_minutes": 5,
+    "max_interval_minutes": 360,
+    "idle_backoff_factor": 2,
+    "active_reset_minutes": 5,
+    "downtime": {
+      "enabled": true,
+      "start": "23:00",
+      "end": "09:00",
+      "timezone": "local"
+    }
   },
   "accounts": {
     "example_account": {
@@ -19,11 +30,17 @@
       "folder": "Videos/ChannelName",
       "account": "example_account",
       "remove_after_download": false,
-      "final_format": "webm"
+      "mode": "full",
+      "final_format": "webm",
+      "music_mode": false
     }
   ],
+  "yt_dlp_cookies": "",
   "yt_dlp_opts": {},
   "filename_template": "%(title)s - %(uploader)s - %(upload_date)s.%(ext)s",
+  "music_filename_template": "%(artist)s/%(album)s/%(track_number)s - %(track)s.%(ext)s",
+  "music_metadata_debug": false,
+  "dry_run": false,
   "upload_date_format": "MM-YYYY",
   "final_format": "webm",
   "js_runtime": "node:/usr/bin/node",

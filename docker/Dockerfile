@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-ARG YT_ARCHIVER_VERSION=1.2.0
+ARG YT_ARCHIVER_VERSION=1.3.0
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -14,7 +14,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        tzdata \
+        nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt

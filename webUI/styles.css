@@ -193,6 +193,14 @@ body {
   box-shadow: var(--shadow);
 }
 
+.panel.subtle {
+  border-style: dashed;
+}
+
+.panel.subtle .panel-title {
+  color: var(--muted);
+}
+
 .panel.full {
   grid-column: 1 / -1;
 }
@@ -201,6 +209,22 @@ body {
   font-size: 16px;
   font-weight: 600;
   margin-bottom: 12px;
+}
+
+#metrics-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+#metrics-panel .panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+#metrics-panel .panel-footer {
+  margin-top: auto;
+  padding-top: 12px;
 }
 
 .stack {
@@ -261,6 +285,37 @@ body {
   color: var(--muted);
 }
 
+.field.gap-top {
+  margin-top: 6px;
+}
+
+.field.short {
+  flex: 0 1 220px;
+  max-width: 240px;
+}
+
+.field.medium {
+  flex: 1 1 320px;
+  max-width: 420px;
+}
+
+.field.long {
+  flex: 1 1 520px;
+  max-width: 640px;
+}
+
+.field.full {
+  flex: 1 1 100%;
+  max-width: none;
+  grid-column: 1 / -1;
+}
+
+.grid .field.short,
+.grid .field.medium,
+.grid .field.long {
+  justify-self: start;
+}
+
 .field.inline {
   flex-direction: row;
   align-items: center;
@@ -271,6 +326,27 @@ body {
   font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 1px;
+}
+
+.delivery-options {
+  gap: 16px;
+}
+
+.radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.radio span {
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.radio input {
+  margin: 0;
 }
 
 input, textarea {
@@ -531,6 +607,61 @@ a[aria-disabled="true"] {
   margin: 10px 0 0;
 }
 
+.account-row .account-name {
+  flex: 0 1 180px;
+  max-width: 200px;
+}
+
+.account-row .field {
+  flex: 1 1 360px;
+  max-width: 520px;
+}
+
+.playlist-row .playlist-name {
+  flex: 0 1 180px;
+  max-width: 200px;
+}
+
+.playlist-row .playlist-id {
+  flex: 1 1 280px;
+  max-width: 340px;
+}
+
+.playlist-row .playlist-folder {
+  flex: 1 1 240px;
+  max-width: 300px;
+}
+
+.playlist-row .playlist-account {
+  flex: 0 1 180px;
+  max-width: 200px;
+}
+
+.playlist-row .playlist-format {
+  flex: 0 1 140px;
+  max-width: 160px;
+}
+
+.playlist-row .field.inline {
+  flex: 0 1 220px;
+  max-width: 260px;
+}
+
+.filters .field.inline {
+  flex: 0 1 240px;
+  max-width: 280px;
+}
+
+.filters .field.long {
+  flex: 1 1 360px;
+  max-width: 440px;
+}
+
+.group .row + .notice,
+.group .grid + .notice {
+  margin-top: 6px;
+}
+
 .account-actions {
   display: flex;
   gap: 8px;
@@ -711,6 +842,14 @@ a[aria-disabled="true"] {
   .row > textarea {
     width: 100%;
     flex: 1 1 auto;
+  }
+
+  .field.short,
+  .field.medium,
+  .field.long {
+    max-width: none;
+    flex: 1 1 auto;
+    width: 100%;
   }
 
   .field.inline {

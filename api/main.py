@@ -26,7 +26,9 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from uuid import uuid4
 
 import anyio
@@ -34,12 +36,35 @@ from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.errors import HttpError
 from pydantic import BaseModel
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.date import DateTrigger
+from google.auth.exceptions import RefreshError
 
-from engine.core import EngineStatus, get_status, load_config, read_history, run_archive, validate_config
+from engine.core import (
+    EngineStatus,
+    build_youtube_clients,
+    extract_playlist_id,
+    get_playlist_videos,
+    get_status,
+    init_db,
+    is_video_downloaded,
+    is_video_seen,
+    _acquire_client_delivery,
+    _finalize_client_delivery,
+    _mark_client_delivery,
+    load_config,
+    mark_video_seen,
+    playlist_has_seen,
+    read_history,
+    run_archive,
+    run_single_playlist,
+    telegram_notify,
+    validate_config,
+)
 from engine.paths import (
     CONFIG_DIR,
     DATA_DIR,
@@ -62,10 +87,16 @@ _BASIC_AUTH_PASS = os.environ.get("YT_ARCHIVER_BASIC_AUTH_PASS")
 _BASIC_AUTH_ENABLED = bool(_BASIC_AUTH_USER and _BASIC_AUTH_PASS)
 _TRUST_PROXY = os.environ.get("YT_ARCHIVER_TRUST_PROXY", "").strip().lower() in {"1", "true", "yes", "on"}
 SCHEDULE_JOB_ID = "archive_schedule"
+WATCHER_JOB_ID = "playlist_watcher"
+DEFERRED_RUN_JOB_ID = "deferred_run"
+WATCHER_QUIET_WINDOW_SECONDS = 60
 OAUTH_SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
 OAUTH_SESSION_TTL = timedelta(minutes=15)
 _OAUTH_SESSIONS = {}
 _OAUTH_LOCK = threading.Lock()
+_DEPRECATED_FIELDS = {"poll_interval_hours"}
+_DEPRECATED_LOGGED = set()
+_MULTI_WORKER_ENV_KEYS = ("UVICORN_WORKERS", "WEB_CONCURRENCY", "GUNICORN_WORKERS")
 
 WEBUI_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "webUI"))
 
@@ -104,14 +135,74 @@ def _setup_logging(log_dir):
         file_handler = logging.FileHandler(log_path)
         file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
         file_handler.setLevel(logging.INFO)
-        root.addHandler(file_handler)
+    root.addHandler(file_handler)
+
+
+def _detect_worker_count():
+    counts = []
+    for key in _MULTI_WORKER_ENV_KEYS:
+        raw = os.environ.get(key)
+        if raw and raw.isdigit():
+            counts.append(int(raw))
+    cmd_args = os.environ.get("GUNICORN_CMD_ARGS", "")
+    if cmd_args:
+        match = re.search(r"--workers\s+(\d+)", cmd_args)
+        if match:
+            counts.append(int(match.group(1)))
+    return max(counts) if counts else 1
+
+
+def _warn_deprecated_fields(config):
+    if not isinstance(config, dict):
+        return
+    for field in sorted(_DEPRECATED_FIELDS):
+        if field in config and field not in _DEPRECATED_LOGGED:
+            logging.warning("Deprecated config field '%s' ignored and will be removed on save", field)
+            _DEPRECATED_LOGGED.add(field)
+
+
+def _strip_deprecated_fields(config):
+    if not isinstance(config, dict):
+        return config
+    updated = dict(config)
+    removed = False
+    # Deprecated fields are ignored to avoid changing runtime behavior.
+    for field in _DEPRECATED_FIELDS:
+        if field in updated:
+            updated.pop(field, None)
+            removed = True
+    if removed:
+        _warn_deprecated_fields(config)
+    return updated
+
+
+def _acquire_watcher_lock(lock_dir):
+    lock_path = os.path.join(lock_dir, "watcher.lock")
+    try:
+        import fcntl
+    except Exception:
+        logging.error("Watcher lock unavailable; watcher disabled")
+        return None
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode("utf-8"))
+    return fd
 
 
 class RunRequest(BaseModel):
     single_url: str | None = None
+    playlist_id: str | None = None
+    playlist_account: str | None = None
     destination: str | None = None
     final_format_override: str | None = None
     js_runtime: str | None = None
+    music_mode: bool | None = None
+    delivery_mode: str | None = None
 
 
 class ConfigPathRequest(BaseModel):
@@ -189,7 +280,13 @@ async def startup():
     app.state.schedule_lock = threading.Lock()
     app.state.ytdlp_update_lock = threading.Lock()
     app.state.ytdlp_update_running = False
+    app.state.cancel_requested = False
     app.state.scheduler = BackgroundScheduler(timezone="UTC")
+    app.state.watch_config_cache = None
+    app.state.was_in_downtime = False
+    app.state.watcher_task = None
+    app.state.worker_count = _detect_worker_count()
+    app.state.single_worker_enforced = app.state.worker_count <= 1
     ensure_dir(DATA_DIR)
     ensure_dir(CONFIG_DIR)
     ensure_dir(LOG_DIR)
@@ -210,6 +307,35 @@ async def startup():
     _apply_schedule_config(schedule_config)
     if schedule_config.get("enabled") and schedule_config.get("run_on_startup"):
         asyncio.create_task(_handle_scheduled_run())
+    if schedule_config.get("enabled"):
+        logging.info("Scheduler active — fixed interval bulk runs")
+
+    init_db(app.state.paths.db_path)
+    watch_policy = normalize_watch_policy(config or {})
+    app.state.watch_policy = watch_policy
+    app.state.watch_config_cache = config
+    app.state.watcher_clients_cache = {}
+    if not app.state.single_worker_enforced:
+        logging.info(
+            "Watcher disabled due to guardrails (multiple workers detected=%d)",
+            app.state.worker_count,
+        )
+        app.state.watcher_lock = None
+    else:
+        app.state.watcher_lock = _acquire_watcher_lock(DATA_DIR)
+    if app.state.watcher_lock is None:
+        logging.info("Watcher disabled due to guardrails (lock unavailable)")
+    else:
+        app.state.watcher_task = asyncio.create_task(_watcher_supervisor())
+        logging.info("Watcher active — adaptive monitoring enabled")
+
+    downtime_active, _ = _check_downtime(config or {})
+    logging.info(
+        "Watcher startup: enabled=%s single_worker=%s downtime_active=%s",
+        bool(app.state.watcher_lock),
+        app.state.single_worker_enforced,
+        downtime_active,
+    )
 
 
 @app.on_event("shutdown")
@@ -225,6 +351,20 @@ async def shutdown():
     scheduler = app.state.scheduler
     if scheduler:
         scheduler.shutdown(wait=False)
+    watcher_task = getattr(app.state, "watcher_task", None)
+    if watcher_task:
+        logging.info("Watcher shutdown")
+        watcher_task.cancel()
+        try:
+            await watcher_task
+        except asyncio.CancelledError:
+            pass
+    lock_fd = getattr(app.state, "watcher_lock", None)
+    if lock_fd is not None:
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
     logging.shutdown()
 
 
@@ -250,15 +390,18 @@ def _path_allowed(path, roots):
 def _resolve_browse_path(root_base, rel_path):
     rel_path = (rel_path or "").strip()
     if os.path.isabs(rel_path):
+        logging.warning("Browse blocked: absolute path %s", rel_path)
         raise HTTPException(status_code=400, detail="path must be relative")
     normalized = os.path.normpath(rel_path)
     if normalized in (".", os.curdir):
         normalized = ""
     if normalized.startswith(".."):
+        logging.warning("Browse blocked: path escape attempt %s", rel_path)
         raise HTTPException(status_code=403, detail="path not allowed")
     abs_path = os.path.realpath(os.path.join(root_base, normalized))
     base = os.path.realpath(root_base)
     if os.path.commonpath([abs_path, base]) != base:
+        logging.warning("Browse blocked: path outside root %s", rel_path)
         raise HTTPException(status_code=403, detail="path not allowed")
     return normalized, abs_path
 
@@ -484,6 +627,21 @@ def _default_schedule_config():
     }
 
 
+def _default_watch_policy():
+    return {
+        "min_interval_minutes": 5,
+        "max_interval_minutes": 360,
+        "idle_backoff_factor": 2,
+        "active_reset_minutes": 5,
+        "downtime": {
+            "enabled": False,
+            "start": "23:00",
+            "end": "09:00",
+            "timezone": "local",
+        },
+    }
+
+
 def _merge_schedule_config(schedule):
     merged = _default_schedule_config()
     if isinstance(schedule, dict):
@@ -491,6 +649,91 @@ def _merge_schedule_config(schedule):
             if key in schedule:
                 merged[key] = schedule[key]
     return merged
+
+
+def _merge_watch_policy(policy):
+    merged = _default_watch_policy()
+    if isinstance(policy, dict):
+        for key in ("min_interval_minutes", "max_interval_minutes", "idle_backoff_factor", "active_reset_minutes"):
+            if key in policy:
+                merged[key] = policy[key]
+        downtime = policy.get("downtime")
+        if isinstance(downtime, dict):
+            merged_downtime = dict(merged["downtime"])
+            for key in ("enabled", "start", "end", "timezone"):
+                if key in downtime:
+                    merged_downtime[key] = downtime[key]
+            merged["downtime"] = merged_downtime
+    return merged
+
+
+def normalize_watch_policy(raw_config):
+    """Apply defaults only when watch_policy is missing; otherwise require full config."""
+    last_good = getattr(app.state, "watch_policy", None) or _default_watch_policy()
+    normalize_watch_policy.valid = True
+
+    if not isinstance(raw_config, dict):
+        logging.error("Invalid watch_policy config; using last-known-good policy")
+        normalize_watch_policy.valid = False
+        return last_good
+
+    if "watch_policy" not in raw_config:
+        # Defaults only when missing entirely.
+        return _default_watch_policy()
+
+    policy = raw_config.get("watch_policy")
+    if not isinstance(policy, dict):
+        logging.error("Invalid watch_policy: must be an object")
+        normalize_watch_policy.valid = False
+        return last_good
+
+    required = {"min_interval_minutes", "max_interval_minutes", "idle_backoff_factor", "active_reset_minutes", "downtime"}
+    missing = sorted(key for key in required if key not in policy)
+    if missing:
+        logging.error("Invalid watch_policy: missing fields %s", ", ".join(missing))
+        normalize_watch_policy.valid = False
+        return last_good
+
+    downtime = policy.get("downtime")
+    if not isinstance(downtime, dict):
+        logging.error("Invalid watch_policy.downtime: must be an object")
+        normalize_watch_policy.valid = False
+        return last_good
+
+    required_dt = {"enabled", "start", "end", "timezone"}
+    missing_dt = sorted(key for key in required_dt if key not in downtime)
+    if missing_dt:
+        logging.error("Invalid watch_policy.downtime: missing fields %s", ", ".join(missing_dt))
+        normalize_watch_policy.valid = False
+        return last_good
+
+    errors = _validate_watch_policy(policy)
+    if errors:
+        logging.error("Invalid watch_policy: %s", errors)
+        normalize_watch_policy.valid = False
+        return last_good
+
+    tz_value = downtime.get("timezone")
+    if tz_value not in {"local", "system", "UTC"}:
+        try:
+            ZoneInfo(tz_value)
+        except Exception:
+            logging.error("Invalid watch_policy.downtime.timezone: %s", tz_value)
+            normalize_watch_policy.valid = False
+            return last_good
+
+    return {
+        "min_interval_minutes": policy["min_interval_minutes"],
+        "max_interval_minutes": policy["max_interval_minutes"],
+        "idle_backoff_factor": policy["idle_backoff_factor"],
+        "active_reset_minutes": policy["active_reset_minutes"],
+        "downtime": {
+            "enabled": downtime["enabled"],
+            "start": downtime["start"],
+            "end": downtime["end"],
+            "timezone": downtime["timezone"],
+        },
+    }
 
 
 def _validate_schedule_config(schedule):
@@ -516,6 +759,52 @@ def _validate_schedule_config(schedule):
     run_on_startup = schedule.get("run_on_startup")
     if run_on_startup is not None and not isinstance(run_on_startup, bool):
         errors.append("schedule.run_on_startup must be true/false")
+    return errors
+
+
+def _validate_watch_policy(policy):
+    if policy is None:
+        return []
+    if not isinstance(policy, dict):
+        return ["watch_policy must be an object"]
+    errors = []
+    min_interval = policy.get("min_interval_minutes")
+    max_interval = policy.get("max_interval_minutes")
+    idle_backoff = policy.get("idle_backoff_factor")
+    active_reset = policy.get("active_reset_minutes")
+    if min_interval is not None and not isinstance(min_interval, int):
+        errors.append("watch_policy.min_interval_minutes must be an integer")
+    if max_interval is not None and not isinstance(max_interval, int):
+        errors.append("watch_policy.max_interval_minutes must be an integer")
+    if idle_backoff is not None and not isinstance(idle_backoff, int):
+        errors.append("watch_policy.idle_backoff_factor must be an integer")
+    if active_reset is not None and not isinstance(active_reset, int):
+        errors.append("watch_policy.active_reset_minutes must be an integer")
+    if isinstance(min_interval, int) and min_interval < 1:
+        errors.append("watch_policy.min_interval_minutes must be >= 1")
+    if isinstance(max_interval, int) and max_interval < 1:
+        errors.append("watch_policy.max_interval_minutes must be >= 1")
+    if isinstance(min_interval, int) and isinstance(max_interval, int) and max_interval < min_interval:
+        errors.append("watch_policy.max_interval_minutes must be >= min_interval_minutes")
+    if isinstance(idle_backoff, int) and idle_backoff < 1:
+        errors.append("watch_policy.idle_backoff_factor must be >= 1")
+    if isinstance(active_reset, int) and active_reset < 1:
+        errors.append("watch_policy.active_reset_minutes must be >= 1")
+    downtime = policy.get("downtime")
+    if downtime is not None:
+        if not isinstance(downtime, dict):
+            errors.append("watch_policy.downtime must be an object")
+        else:
+            enabled = downtime.get("enabled")
+            if enabled is not None and not isinstance(enabled, bool):
+                errors.append("watch_policy.downtime.enabled must be true/false")
+            for key in ("start", "end"):
+                value = downtime.get(key)
+                if value is not None and not isinstance(value, str):
+                    errors.append(f"watch_policy.downtime.{key} must be a string (HH:MM)")
+            timezone_value = downtime.get("timezone")
+            if timezone_value is not None and not isinstance(timezone_value, str):
+                errors.append("watch_policy.downtime.timezone must be a string")
     return errors
 
 
@@ -559,7 +848,8 @@ def _read_config_or_404():
     errors = validate_config(config)
     if errors:
         raise HTTPException(status_code=400, detail={"errors": errors})
-    return config
+    _warn_deprecated_fields(config)
+    return _strip_deprecated_fields(config)
 
 
 def _read_config_for_scheduler():
@@ -579,6 +869,38 @@ def _read_config_for_scheduler():
     if errors:
         logging.error("Schedule skipped: invalid config: %s", errors)
         return None
+    _warn_deprecated_fields(config)
+    return _strip_deprecated_fields(config)
+
+
+def _read_config_for_watcher():
+    config_path = app.state.config_path
+    cached = app.state.watch_config_cache
+    if not os.path.exists(config_path):
+        logging.error("Watcher skipped: config not found at %s", config_path)
+        return cached
+    try:
+        with open(config_path, "r") as handle:
+            data = handle.read()
+        config = json.loads(data)
+    except json.JSONDecodeError as exc:
+        logging.error("Watcher skipped: invalid JSON in config: %s", exc)
+        return cached
+    except OSError as exc:
+        logging.error("Watcher skipped: failed to read config: %s", exc)
+        return cached
+    errors = validate_config(config)
+    if errors:
+        logging.error("Watcher skipped: invalid config: %s", errors)
+        return cached
+    _warn_deprecated_fields(config)
+    config = _strip_deprecated_fields(config)
+    policy = normalize_watch_policy(config)
+    if not getattr(normalize_watch_policy, "valid", True):
+        return cached or config
+    config["watch_policy"] = policy
+    app.state.watch_policy = policy
+    app.state.watch_config_cache = config
     return config
 
 
@@ -586,18 +908,26 @@ async def _start_run_with_config(
     config,
     *,
     single_url=None,
+    playlist_id=None,
+    playlist_account=None,
+    playlist_mode=None,
     destination=None,
     final_format_override=None,
     js_runtime=None,
+    music_mode=None,
     run_source="api",
+    skip_downtime=False,
+    run_id_override=None,
+    now=None,
+    delivery_mode=None,
 ):
     async with app.state.run_lock:
         if app.state.running:
-            return False
+            return "busy", None
 
         app.state.running = True
         app.state.state = "running"
-        app.state.run_id = str(uuid4())
+        app.state.run_id = run_id_override or str(uuid4())
         app.state.started_at = datetime.now(timezone.utc).isoformat()
         app.state.finished_at = None
         app.state.last_error = None
@@ -607,7 +937,29 @@ async def _start_run_with_config(
 
         async def _runner():
             try:
-                run_callable = functools.partial(
+                if run_source == "watcher":
+                    logging.info("Watcher-triggered run starting")
+                elif run_source == "scheduled":
+                    logging.info("Scheduled run starting")
+                else:
+                    logging.info("Manual run starting (source=%s)", run_source)
+                if playlist_id:
+                    run_callable = functools.partial(
+                        run_single_playlist,
+                        config,
+                        playlist_id,
+                        destination,
+                        playlist_account,
+                        final_format_override,
+                        paths=app.state.paths,
+                        status=status,
+                        js_runtime_override=js_runtime,
+                        stop_event=app.state.stop_event,
+                        music_mode=bool(music_mode) if music_mode is not None else False,
+                        mode=playlist_mode or "full",
+                    )
+                else:
+                    run_callable = functools.partial(
                     run_archive,
                     config,
                     paths=app.state.paths,
@@ -618,10 +970,16 @@ async def _start_run_with_config(
                     js_runtime_override=js_runtime,
                     stop_event=app.state.stop_event,
                     run_source=run_source,
+                    music_mode=bool(music_mode) if music_mode is not None else False,
+                    skip_downtime=skip_downtime,
+                    delivery_mode=delivery_mode or "server",
                 )
                 await anyio.to_thread.run_sync(run_callable)
                 if app.state.stop_event.is_set():
-                    app.state.last_error = "Run stopped"
+                    if app.state.cancel_requested:
+                        app.state.last_error = "Downloads cancelled by user"
+                    else:
+                        app.state.last_error = "Run stopped"
                     app.state.state = "error"
             except Exception as exc:
                 logging.exception("Archive run failed: %s", exc)
@@ -630,12 +988,21 @@ async def _start_run_with_config(
             finally:
                 app.state.running = False
                 app.state.finished_at = datetime.now(timezone.utc).isoformat()
-                if app.state.state == "running":
+                if app.state.cancel_requested:
+                    logging.info("Active downloads killed")
+                    app.state.cancel_requested = False
+                    app.state.state = "idle"
+                    app.state.last_error = "Downloads cancelled by user"
+                    _cleanup_dir(app.state.paths.temp_downloads_dir)
+                    _cleanup_dir(app.state.paths.ytdlp_temp_dir)
+                    logging.info("Downloads cancelled by user")
+                    logging.info("State reset to idle")
+                elif app.state.state == "running":
                     app.state.state = "idle"
 
         app.state.run_task = asyncio.create_task(_runner())
 
-    return True
+    return "started", None
 
 
 def _get_next_run_iso():
@@ -666,6 +1033,7 @@ def _set_schedule_state(*, last_run=_UNSET, next_run=_UNSET):
 
 
 def _schedule_tick():
+    # Scheduler = periodic full runs based on schedule config.
     loop = app.state.loop
     if not loop or loop.is_closed():
         return
@@ -681,10 +1049,13 @@ async def _handle_scheduled_run():
     if not config:
         _set_schedule_state(next_run=_get_next_run_iso())
         return
-    started = await _start_run_with_config(config, run_source="scheduled")
-    if started:
+    result, next_allowed = await _start_run_with_config(config, run_source="scheduled")
+    if result == "started":
+        logging.info("Scheduled run starting")
         now = datetime.now(timezone.utc).isoformat()
         _set_schedule_state(last_run=now, next_run=_get_next_run_iso())
+    elif result == "deferred":
+        _set_schedule_state(next_run=_format_iso(next_allowed))
     else:
         _set_schedule_state(next_run=_get_next_run_iso())
 
@@ -729,11 +1100,711 @@ def _schedule_response():
     }
 
 
+def _parse_iso(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _format_iso(dt):
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _parse_hhmm(value):
+    if not value:
+        return None
+    value = value.strip()
+    if not value or ":" not in value:
+        return None
+    parts = value.split(":", 1)
+    if len(parts) != 2:
+        return None
+    if not parts[0].isdigit() or not parts[1].isdigit():
+        return None
+    hour = int(parts[0])
+    minute = int(parts[1])
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+    return hour, minute
+
+
+def _resolve_timezone(value, fallback_tzinfo):
+    if not value or value.lower() in {"local", "system"}:
+        return fallback_tzinfo or timezone.utc
+    if value.upper() == "UTC":
+        return timezone.utc
+    try:
+        return ZoneInfo(value)
+    except Exception:
+        logging.warning("Invalid watch_policy timezone %s; falling back to local", value)
+        return fallback_tzinfo or timezone.utc
+
+
+def in_downtime(now, start_str, end_str):
+    start = _parse_hhmm(start_str)
+    end = _parse_hhmm(end_str)
+    if not start or not end:
+        return False, None
+    # Compare in the same timezone; handles windows that cross midnight.
+    start_dt = now.replace(hour=start[0], minute=start[1], second=0, microsecond=0)
+    end_dt = now.replace(hour=end[0], minute=end[1], second=0, microsecond=0)
+    if start_dt <= end_dt:
+        in_window = start_dt <= now < end_dt
+        next_allowed = end_dt if in_window else None
+        return in_window, next_allowed
+    # Window crosses midnight.
+    if now >= start_dt:
+        return True, end_dt + timedelta(days=1)
+    if now < end_dt:
+        return True, end_dt
+    return False, None
+
+
+def _check_downtime(config, *, now=None):
+    policy = normalize_watch_policy(config)
+    downtime = policy.get("downtime") or {}
+    if not downtime.get("enabled"):
+        return False, None
+    if now is None:
+        local_now = datetime.now().astimezone()
+    else:
+        local_now = now
+    tzinfo = _resolve_timezone(downtime.get("timezone"), local_now.tzinfo)
+    now = local_now.astimezone(tzinfo)
+    return in_downtime(now, downtime.get("start"), downtime.get("end"))
+
+
+def _deferred_run_tick(payload):
+    loop = app.state.loop
+    if not loop or loop.is_closed():
+        return
+    asyncio.run_coroutine_threadsafe(_handle_deferred_run(payload), loop)
+
+
+async def _handle_deferred_run(payload):
+    if app.state.running:
+        delay = datetime.now(timezone.utc) + timedelta(minutes=1)
+        scheduler = app.state.scheduler
+        if scheduler:
+            scheduler.add_job(
+                _deferred_run_tick,
+                trigger=DateTrigger(run_date=delay),
+                args=[payload],
+                id=f"{DEFERRED_RUN_JOB_ID}_{uuid4()}",
+                replace_existing=False,
+                max_instances=1,
+                misfire_grace_time=30,
+            )
+        return
+    config = payload.get("config") if isinstance(payload, dict) else None
+    if config:
+        in_dt, next_allowed = _check_downtime(config)
+        if in_dt and next_allowed:
+            _schedule_deferred_run(payload, next_allowed)
+            return
+    await _start_run_with_config(**payload, skip_downtime=True)
+
+
+def _schedule_deferred_run(payload, next_allowed):
+    scheduler = app.state.scheduler
+    if not scheduler or not next_allowed:
+        return
+    scheduler.add_job(
+        _deferred_run_tick,
+        trigger=DateTrigger(run_date=next_allowed),
+        args=[payload],
+        id=f"{DEFERRED_RUN_JOB_ID}_{uuid4()}",
+        replace_existing=False,
+        max_instances=1,
+        misfire_grace_time=30,
+    )
+
+
+def _read_watch_state(db_path):
+    rows = {}
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT playlist_id, last_checked_at, next_poll_at, idle_count, "
+        "current_interval_min, consecutive_no_change, last_change_at, skip_reason, "
+        "last_error, last_error_at "
+        "FROM playlist_watch"
+    )
+    for (
+        playlist_id,
+        last_checked_at,
+        next_poll_at,
+        idle_count,
+        interval,
+        consecutive,
+        last_change_at,
+        skip_reason,
+        last_error,
+        last_error_at,
+    ) in cur.fetchall():
+        effective_consecutive = consecutive if consecutive is not None else (idle_count or 0)
+        rows[playlist_id] = {
+            "last_checked_at": last_checked_at,
+            "next_poll_at": next_poll_at,
+            "idle_count": idle_count or 0,
+            "current_interval_min": interval,
+            "consecutive_no_change": effective_consecutive or 0,
+            "last_change_at": last_change_at,
+            "skip_reason": skip_reason,
+            "last_error": last_error,
+            "last_error_at": last_error_at,
+        }
+    conn.close()
+    return rows
+
+
+def _write_watch_state(
+    db_path,
+    playlist_id,
+    *,
+    last_checked_at=None,
+    next_poll_at=None,
+    idle_count=None,
+    current_interval_min=None,
+    consecutive_no_change=None,
+    last_change_at=None,
+    skip_reason=None,
+    last_error=None,
+    last_error_at=None,
+):
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO playlist_watch ("
+        "playlist_id, last_checked_at, next_poll_at, idle_count, "
+        "current_interval_min, consecutive_no_change, last_change_at, skip_reason, "
+        "last_error, last_error_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(playlist_id) DO UPDATE SET "
+        "last_checked_at=excluded.last_checked_at, next_poll_at=excluded.next_poll_at, "
+        "idle_count=excluded.idle_count, current_interval_min=excluded.current_interval_min, "
+        "consecutive_no_change=excluded.consecutive_no_change, last_change_at=excluded.last_change_at, "
+        "skip_reason=excluded.skip_reason, last_error=excluded.last_error, "
+        "last_error_at=excluded.last_error_at",
+        (
+            playlist_id,
+            last_checked_at,
+            next_poll_at,
+            idle_count,
+            current_interval_min,
+            consecutive_no_change,
+            last_change_at,
+            skip_reason,
+            last_error,
+            last_error_at,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _playlist_label(playlist_id, playlist_name):
+    label = playlist_name or playlist_id
+    return label if label else "unknown"
+
+
+def _log_skip_reason(playlist_id, reason, watch, *, next_check=None):
+    prev = watch.get("skip_reason")
+    if reason != prev:
+        if next_check:
+            logging.debug("Watcher skipped (%s) playlist_id=%s next_check=%s", reason, playlist_id, next_check)
+        else:
+            logging.debug("Watcher skipped (%s) playlist_id=%s", reason, playlist_id)
+    return reason
+
+
+async def _poll_single_playlist(config, now, policy, pl, watch, yt_clients, batch_state):
+    playlist_key = pl.get("playlist_id") or pl.get("id")
+    if not playlist_key:
+        return
+    playlist_id = extract_playlist_id(playlist_key) or playlist_key
+    playlist_name = pl.get("name") or ""
+
+    min_interval = policy.get("min_interval_minutes") or 5
+    max_interval = policy.get("max_interval_minutes") or min_interval
+    backoff_factor = policy.get("idle_backoff_factor") or 2
+    active_reset = policy.get("active_reset_minutes") or min_interval
+    active_interval = max(min_interval, min(active_reset, max_interval))
+
+    consecutive_no_change = watch.get("consecutive_no_change") or 0
+    current_interval = watch.get("current_interval_min")
+    if not isinstance(current_interval, int) or current_interval < min_interval:
+        current_interval = min_interval
+
+    if watch.get("current_interval_min") is None:
+        _write_watch_state(
+            app.state.paths.db_path,
+            playlist_id,
+            last_checked_at=watch.get("last_checked_at"),
+            next_poll_at=watch.get("next_poll_at"),
+            idle_count=consecutive_no_change,
+            current_interval_min=current_interval,
+            consecutive_no_change=consecutive_no_change,
+            last_change_at=watch.get("last_change_at"),
+            skip_reason=watch.get("skip_reason"),
+            last_error=watch.get("last_error"),
+            last_error_at=watch.get("last_error_at"),
+        )
+
+    account = pl.get("account")
+    yt = yt_clients.get(account) if account else None
+    if not yt:
+        skip_reason = _log_skip_reason(playlist_id, "oauth missing", watch)
+        error_at = _format_iso(now)
+        consecutive_no_change += 1
+        current_interval = min(current_interval * backoff_factor, max_interval)
+        logging.debug(
+            "Watcher backoff applied playlist_id=%s interval_min=%s no_change=%s",
+            playlist_id,
+            current_interval,
+            consecutive_no_change,
+        )
+        _write_watch_state(
+            app.state.paths.db_path,
+            playlist_id,
+            last_checked_at=watch.get("last_checked_at"),
+            next_poll_at=_format_iso(now + timedelta(minutes=current_interval)),
+            idle_count=consecutive_no_change,
+            current_interval_min=current_interval,
+            consecutive_no_change=consecutive_no_change,
+            last_change_at=watch.get("last_change_at"),
+            skip_reason=skip_reason,
+            last_error="oauth missing",
+            last_error_at=error_at,
+        )
+        return
+
+    try:
+        videos = get_playlist_videos(yt, playlist_id)
+    except RefreshError as exc:
+        logging.error("Watcher poll error playlist_id=%s error=%s", playlist_id, exc)
+        skip_reason = _log_skip_reason(playlist_id, "poll error", watch)
+        error_at = _format_iso(now)
+        consecutive_no_change += 1
+        current_interval = min(current_interval * backoff_factor, max_interval)
+        logging.debug(
+            "Watcher backoff applied playlist_id=%s interval_min=%s no_change=%s",
+            playlist_id,
+            current_interval,
+            consecutive_no_change,
+        )
+        _write_watch_state(
+            app.state.paths.db_path,
+            playlist_id,
+            last_checked_at=_format_iso(now),
+            next_poll_at=_format_iso(now + timedelta(minutes=current_interval)),
+            idle_count=consecutive_no_change,
+            current_interval_min=current_interval,
+            consecutive_no_change=consecutive_no_change,
+            last_change_at=watch.get("last_change_at"),
+            skip_reason=skip_reason,
+            last_error=f"api error: {exc}",
+            last_error_at=error_at,
+        )
+        return
+    except HttpError as exc:
+        logging.error("Watcher poll error playlist_id=%s error=%s", playlist_id, exc)
+        skip_reason = _log_skip_reason(playlist_id, "poll error", watch)
+        error_at = _format_iso(now)
+        consecutive_no_change += 1
+        current_interval = min(current_interval * backoff_factor, max_interval)
+        logging.debug(
+            "Watcher backoff applied playlist_id=%s interval_min=%s no_change=%s",
+            playlist_id,
+            current_interval,
+            consecutive_no_change,
+        )
+        _write_watch_state(
+            app.state.paths.db_path,
+            playlist_id,
+            last_checked_at=_format_iso(now),
+            next_poll_at=_format_iso(now + timedelta(minutes=current_interval)),
+            idle_count=consecutive_no_change,
+            current_interval_min=current_interval,
+            consecutive_no_change=consecutive_no_change,
+            last_change_at=watch.get("last_change_at"),
+            skip_reason=skip_reason,
+            last_error=f"api error: {exc}",
+            last_error_at=error_at,
+        )
+        return
+
+    if not videos:
+        logging.debug("Watcher polled playlist_id=%s items=0", playlist_id)
+        consecutive_no_change += 1
+        current_interval = min(current_interval * backoff_factor, max_interval)
+        logging.debug(
+            "Watcher backoff applied playlist_id=%s interval_min=%s no_change=%s",
+            playlist_id,
+            current_interval,
+            consecutive_no_change,
+        )
+        _write_watch_state(
+            app.state.paths.db_path,
+            playlist_id,
+            last_checked_at=_format_iso(now),
+            next_poll_at=_format_iso(now + timedelta(minutes=current_interval)),
+            idle_count=consecutive_no_change,
+            current_interval_min=current_interval,
+            consecutive_no_change=consecutive_no_change,
+            last_change_at=watch.get("last_change_at"),
+            skip_reason=None,
+            last_error=watch.get("last_error"),
+            last_error_at=watch.get("last_error_at"),
+        )
+        return
+
+    if any("position" in v or "playlist_index" in v for v in videos):
+        videos = sorted(
+            videos,
+            key=lambda v: v.get("position") or v.get("playlist_index") or 0,
+            reverse=True,
+        )
+    else:
+        videos = list(reversed(videos))
+
+    playlist_mode = (pl.get("mode") or "full").lower()
+    if playlist_mode not in {"full", "subscribe"}:
+        playlist_mode = "full"
+    subscribe_mode = playlist_mode == "subscribe"
+    label = _playlist_label(playlist_id, playlist_name)
+    logging.debug("Watcher polled playlist_id=%s items=%s", playlist_id, len(videos))
+
+    with sqlite3.connect(app.state.paths.db_path) as conn:
+        if subscribe_mode and not playlist_has_seen(conn, playlist_id):
+            # First watcher pass for subscribe mode marks items as seen without downloading.
+            for entry in videos:
+                vid = entry.get("videoId") or entry.get("id")
+                if not vid:
+                    continue
+                mark_video_seen(conn, playlist_id, vid, downloaded=False)
+            conn.commit()
+            logging.debug(
+                'Watcher subscribe first run playlist_id=%s label="%s" seen=%d download=0',
+                playlist_id,
+                label,
+                len(videos),
+            )
+            consecutive_no_change = 0
+            current_interval = active_interval
+            _write_watch_state(
+                app.state.paths.db_path,
+                playlist_id,
+                last_checked_at=_format_iso(now),
+                next_poll_at=_format_iso(now + timedelta(minutes=current_interval)),
+                idle_count=consecutive_no_change,
+                current_interval_min=current_interval,
+                consecutive_no_change=consecutive_no_change,
+                last_change_at=watch.get("last_change_at"),
+                skip_reason=None,
+                last_error=watch.get("last_error"),
+                last_error_at=watch.get("last_error_at"),
+            )
+            return
+
+    new_ids = []
+    with sqlite3.connect(app.state.paths.db_path) as conn:
+        if subscribe_mode:
+            for entry in videos:
+                vid = entry.get("videoId") or entry.get("id")
+                if not vid:
+                    continue
+                if is_video_seen(conn, playlist_id, vid):
+                    break
+                new_ids.append(vid)
+        else:
+            for entry in videos:
+                vid = entry.get("videoId") or entry.get("id")
+                if not vid:
+                    continue
+                if not is_video_downloaded(conn, vid):
+                    new_ids.append(vid)
+
+    if new_ids:
+        pending = batch_state["pending_playlists"]
+        pending.add(playlist_id)
+        batch_state["last_detection_ts"] = time.monotonic()
+        logging.info(
+            "Watcher: detected updates playlist_id=%s pending=%s",
+            playlist_id,
+            len(pending),
+        )
+        current_interval = active_interval
+        consecutive_no_change = 0
+        last_change_at = _format_iso(now)
+        next_poll_at = now + timedelta(minutes=current_interval)
+        _write_watch_state(
+            app.state.paths.db_path,
+            playlist_id,
+            last_checked_at=_format_iso(now),
+            next_poll_at=_format_iso(next_poll_at),
+            idle_count=consecutive_no_change,
+            current_interval_min=current_interval,
+            consecutive_no_change=consecutive_no_change,
+            last_change_at=last_change_at,
+            skip_reason=None,
+            last_error=watch.get("last_error"),
+            last_error_at=watch.get("last_error_at"),
+        )
+        return
+
+    consecutive_no_change += 1
+    current_interval = min(current_interval * backoff_factor, max_interval)
+    logging.debug(
+        "Watcher backoff applied playlist_id=%s interval_min=%s no_change=%s",
+        playlist_id,
+        current_interval,
+        consecutive_no_change,
+    )
+    _write_watch_state(
+        app.state.paths.db_path,
+        playlist_id,
+        last_checked_at=_format_iso(now),
+        next_poll_at=_format_iso(now + timedelta(minutes=current_interval)),
+        idle_count=consecutive_no_change,
+        current_interval_min=current_interval,
+        consecutive_no_change=consecutive_no_change,
+        last_change_at=watch.get("last_change_at"),
+        skip_reason=None,
+        last_error=watch.get("last_error"),
+        last_error_at=watch.get("last_error_at"),
+    )
+
+
+async def _watcher_supervisor():
+    # Watcher = adaptive per-playlist monitoring that triggers runs when changes are detected.
+    logging.info("Watcher started")
+    batch_state = {
+        "pending_playlists": set(),
+        "last_detection_ts": None,
+        "batch_active": False,
+    }
+    while True:
+        if getattr(app.state, "watcher_lock", None) is None:
+            return
+        config = _read_config_for_watcher()
+        if not config:
+            await asyncio.sleep(60)
+            continue
+
+        policy = normalize_watch_policy(config)
+        downtime = policy.get("downtime") or {}
+        local_now = datetime.now().astimezone()
+        tzinfo = _resolve_timezone(downtime.get("timezone"), local_now.tzinfo)
+        now = local_now.astimezone(tzinfo)
+
+        if downtime.get("enabled"):
+            downtime_active, _next_allowed = in_downtime(
+                now,
+                downtime.get("start"),
+                downtime.get("end"),
+            )
+            if downtime_active and not app.state.was_in_downtime:
+                logging.info("Watcher entering downtime window")
+            if not downtime_active and app.state.was_in_downtime:
+                logging.info("Watcher exiting downtime window")
+            if downtime_active:
+                app.state.was_in_downtime = True
+
+        playlists = config.get("playlists") or []
+        if not playlists:
+            await asyncio.sleep(60)
+            continue
+        playlist_map = {}
+        for pl in playlists:
+            playlist_key = pl.get("playlist_id") or pl.get("id")
+            if not playlist_key:
+                continue
+            playlist_id = extract_playlist_id(playlist_key) or playlist_key
+            playlist_map[playlist_id] = pl
+
+        if (batch_state["pending_playlists"] and batch_state["last_detection_ts"] is not None
+                and not batch_state["batch_active"]):
+            elapsed = time.monotonic() - batch_state["last_detection_ts"]
+            if elapsed >= WATCHER_QUIET_WINDOW_SECONDS:
+                logging.info(
+                    "Watcher: quiet window elapsed (%ss), preparing batch run",
+                    WATCHER_QUIET_WINDOW_SECONDS,
+                )
+                batch_state["batch_active"] = True
+                batch_playlists = list(batch_state["pending_playlists"])
+                batch_state["pending_playlists"].clear()
+                logging.info(
+                    "Watcher: starting batch run playlists=%s",
+                    ",".join(batch_playlists),
+                )
+                batch_start = time.monotonic()
+                total_downloaded = 0
+                for playlist_id in batch_playlists:
+                    pl = playlist_map.get(playlist_id)
+                    if not pl:
+                        logging.warning("Watcher: batch playlist missing config playlist_id=%s", playlist_id)
+                        continue
+                    logging.info("Watcher: batch downloading playlist_id=%s", playlist_id)
+                    result, _next_allowed = await _start_run_with_config(
+                        config,
+                        playlist_id=playlist_id,
+                        playlist_account=pl.get("account"),
+                        playlist_mode=(pl.get("mode") or "full"),
+                        destination=pl.get("folder") or pl.get("directory"),
+                        final_format_override=pl.get("final_format"),
+                        music_mode=bool(pl.get("music_mode")),
+                        run_source="watcher",
+                        now=now,
+                    )
+                    if result == "started":
+                        if app.state.run_task:
+                            await app.state.run_task
+                        status = app.state.status
+                        if status:
+                            total_downloaded += len(status.run_successes or [])
+                    elif result == "deferred":
+                        logging.info("Watcher: batch deferred playlist_id=%s", playlist_id)
+                    else:
+                        logging.debug("Watcher: batch skipped (run active) playlist_id=%s", playlist_id)
+                duration_seconds = max(0, int(time.monotonic() - batch_start))
+                logging.info(
+                    "Watcher: batch complete playlists=%s videos=%s",
+                    len(batch_playlists),
+                    total_downloaded,
+                )
+                if batch_playlists:
+                    minutes = duration_seconds // 60
+                    seconds = duration_seconds % 60
+                    duration_label = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+                    msg = (
+                        "YouTube Archiver Watcher Batch\n"
+                        f"Playlists: {len(batch_playlists)}\n"
+                        f"Videos downloaded: {total_downloaded}\n"
+                        f"Duration: {duration_label}"
+                    )
+                    telegram_notify(config, msg)
+                batch_state["batch_active"] = False
+                batch_state["last_detection_ts"] = None
+                logging.info("Watcher: batch state reset, resuming monitoring")
+                continue
+
+        if downtime.get("enabled") and downtime_active:
+            await asyncio.sleep(60)
+            continue
+
+        watch_state = _read_watch_state(app.state.paths.db_path)
+        if app.state.was_in_downtime:
+            app.state.was_in_downtime = False
+            for pl in playlists:
+                playlist_key = pl.get("playlist_id") or pl.get("id")
+                if not playlist_key:
+                    continue
+                playlist_id = extract_playlist_id(playlist_key) or playlist_key
+                watch = watch_state.get(playlist_id) or {}
+                consecutive_no_change = watch.get("consecutive_no_change") or 0
+                current_interval = watch.get("current_interval_min")
+                if not isinstance(current_interval, int):
+                    current_interval = policy.get("min_interval_minutes") or 5
+                _write_watch_state(
+                    app.state.paths.db_path,
+                    playlist_id,
+                    last_checked_at=watch.get("last_checked_at"),
+                    next_poll_at=_format_iso(now),
+                    idle_count=consecutive_no_change,
+                    current_interval_min=current_interval,
+                    consecutive_no_change=consecutive_no_change,
+                    last_change_at=watch.get("last_change_at"),
+                    skip_reason=watch.get("skip_reason"),
+                    last_error=watch.get("last_error"),
+                    last_error_at=watch.get("last_error_at"),
+                )
+            watch_state = _read_watch_state(app.state.paths.db_path)
+
+        candidates = []
+        for pl in playlists:
+            playlist_id = extract_playlist_id(pl.get("playlist_id") or pl.get("id")) or pl.get("playlist_id") or pl.get("id")
+            watch = watch_state.get(playlist_id) or {}
+            next_poll_at = _parse_iso(watch.get("next_poll_at")) or now
+            candidates.append((next_poll_at, pl, watch))
+
+        if not candidates:
+            await asyncio.sleep(60)
+            continue
+
+        candidates.sort(key=lambda item: item[0])
+        next_poll_at, pl, watch = candidates[0]
+        if now < next_poll_at:
+            sleep_seconds = max(0.0, (next_poll_at - now).total_seconds())
+            if (batch_state["pending_playlists"] and batch_state["last_detection_ts"] is not None
+                    and not batch_state["batch_active"]):
+                quiet_remaining = WATCHER_QUIET_WINDOW_SECONDS - (time.monotonic() - batch_state["last_detection_ts"])
+                if quiet_remaining > 0:
+                    sleep_seconds = min(sleep_seconds, quiet_remaining)
+                else:
+                    sleep_seconds = 0
+            if sleep_seconds > 0:
+                await asyncio.sleep(sleep_seconds)
+            continue
+
+        accounts = config.get("accounts") or {}
+        refresh_log_state = set()
+        yt_clients = (
+            build_youtube_clients(
+                accounts,
+                config,
+                cache=getattr(app.state, "watcher_clients_cache", {}),
+                refresh_log_state=refresh_log_state,
+            )
+            if accounts
+            else {}
+        )
+        await _poll_single_playlist(config, now, policy, pl, watch, yt_clients, batch_state)
+
+
+def _apply_watch_policy(policy):
+    if getattr(app.state, "watcher_lock", None) is None:
+        return
+    # Supervisor loop reads watch_policy each iteration.
+    app.state.watch_policy = policy
+
+
 @app.get("/api/status")
 async def api_status():
     status = get_status(app.state.status)
     last_path = status.pop("last_completed_path", None)
     status["last_completed_file_id"] = _file_id_from_path(last_path) if last_path else None
+    watcher_errors = []
+    try:
+        watch_state = _read_watch_state(app.state.paths.db_path)
+        for playlist_id, entry in watch_state.items():
+            last_error = entry.get("last_error")
+            if last_error:
+                watcher_errors.append({
+                    "playlist_id": playlist_id,
+                    "last_error": last_error,
+                    "last_error_at": entry.get("last_error_at"),
+                })
+    except Exception:
+        logging.exception("Failed to read watcher error state")
+    watcher_policy = getattr(app.state, "watch_policy", _default_watch_policy())
+    watcher_downtime = watcher_policy.get("downtime") or {}
+    local_now = datetime.now().astimezone()
+    tzinfo = _resolve_timezone(watcher_downtime.get("timezone"), local_now.tzinfo)
+    now = local_now.astimezone(tzinfo)
+    paused = False
+    if watcher_downtime.get("enabled"):
+        paused, _ = in_downtime(now, watcher_downtime.get("start"), watcher_downtime.get("end"))
     return {
         "schema_version": STATUS_SCHEMA_VERSION,
         "server_time": datetime.now(timezone.utc).isoformat(),
@@ -743,6 +1814,14 @@ async def api_status():
         "started_at": app.state.started_at,
         "finished_at": app.state.finished_at,
         "error": app.state.last_error,
+        "watcher": {
+            "enabled": bool(getattr(app.state, "watcher_lock", None)),
+            "paused": bool(paused),
+        },
+        "scheduler": {
+            "enabled": bool((app.state.schedule_config or {}).get("enabled", False)),
+        },
+        "watcher_errors": watcher_errors,
         "status": status,
     }
 
@@ -935,17 +2014,51 @@ async def api_put_config_path(payload: ConfigPathRequest):
 @app.post("/api/run", status_code=202)
 async def api_run(request: RunRequest):
     config = _read_config_or_404()
-    started = await _start_run_with_config(
+    if request.single_url and request.playlist_id:
+        raise HTTPException(status_code=400, detail="Provide either single_url or playlist_id, not both")
+    if request.playlist_account:
+        accounts = (config.get("accounts") or {}) if isinstance(config, dict) else {}
+        if request.playlist_account not in accounts:
+            raise HTTPException(status_code=400, detail="playlist_account not found in config")
+    logging.info(
+        "Manual run requested (source=api) single_url=%s playlist_id=%s",
+        bool(request.single_url),
+        request.playlist_id or "-",
+    )
+    result, _next_allowed = await _start_run_with_config(
         config,
         single_url=request.single_url,
+        playlist_id=request.playlist_id,
+        playlist_account=request.playlist_account,
         destination=request.destination,
         final_format_override=request.final_format_override,
         js_runtime=request.js_runtime,
+        music_mode=request.music_mode,
         run_source="api",
+        skip_downtime=bool(request.single_url),
+        delivery_mode=request.delivery_mode,
     )
-    if not started:
+    if result == "busy":
         raise HTTPException(status_code=409, detail="Archive run already in progress")
     return {"run_id": app.state.run_id, "status": "started"}
+
+
+@app.post("/api/cancel")
+async def api_cancel():
+    logging.info("Cancel requested by user")
+    if not app.state.running:
+        return {"status": "idle"}
+    app.state.cancel_requested = True
+    app.state.stop_event.set()
+    status = app.state.status
+    if status:
+        lock = getattr(status, "lock", None)
+        if lock:
+            with lock:
+                status.last_error_message = "Downloads cancelled by user"
+        else:
+            status.last_error_message = "Downloads cancelled by user"
+    return {"status": "cancelling"}
 
 
 @app.get("/api/logs", response_class=PlainTextResponse)
@@ -960,6 +2073,7 @@ async def api_get_config():
 
 @app.put("/api/config")
 async def api_put_config(payload: dict = Body(...)):
+    payload = _strip_deprecated_fields(payload)
     errors = validate_config(payload)
     if errors:
         raise HTTPException(status_code=400, detail={"errors": errors})
@@ -990,6 +2104,11 @@ async def api_put_config(payload: dict = Body(...)):
         schedule = _merge_schedule_config(payload.get("schedule"))
         app.state.schedule_config = schedule
         _apply_schedule_config(schedule)
+    policy = normalize_watch_policy(payload)
+    if getattr(normalize_watch_policy, "valid", True):
+        app.state.watch_policy = policy
+        _apply_watch_policy(policy)
+        app.state.watch_config_cache = payload
 
     return {"status": "updated"}
 
@@ -1058,6 +2177,45 @@ async def api_file_download(file_id: str):
     return StreamingResponse(_iter_file(candidate), media_type=content_type or "application/octet-stream", headers=headers)
 
 
+@app.get("/api/deliveries/{delivery_id}/download")
+async def api_delivery_download(delivery_id: str):
+    entry = _acquire_client_delivery(delivery_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Delivery not available")
+    candidate = entry.get("path")
+    if not candidate or not os.path.isfile(candidate):
+        _mark_client_delivery(delivery_id, delivered=False)
+        raise HTTPException(status_code=404, detail="Delivery file not found")
+
+    filename = _safe_filename(entry.get("filename") or os.path.basename(candidate))
+    content_type, _ = mimetypes.guess_type(candidate)
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    logging.info("HTTP client download started delivery_id=%s", delivery_id)
+
+    def stream():
+        completed = False
+        try:
+            with open(candidate, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            completed = True
+        except Exception:
+            logging.exception("Client delivery stream failed delivery_id=%s", delivery_id)
+            raise
+        finally:
+            _mark_client_delivery(delivery_id, delivered=completed)
+            if completed:
+                logging.info("HTTP client download complete → cleanup")
+            else:
+                logging.warning("HTTP client download incomplete → cleanup")
+            _finalize_client_delivery(delivery_id, timeout=False)
+
+    return StreamingResponse(stream(), media_type=content_type or "application/octet-stream", headers=headers)
+
+
 @app.post("/api/cleanup")
 async def api_cleanup():
     paths = app.state.paths
@@ -1106,6 +2264,7 @@ async def api_browse(
 
     base = roots[root]
     rel_path, target = _resolve_browse_path(base, path)
+    logging.info("Browse opened root=%s path=%s mode=%s", root, rel_path or "/", mode)
     if not os.path.exists(target):
         raise HTTPException(status_code=404, detail=f"Path not found: {target}")
     if os.path.isfile(target):

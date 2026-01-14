@@ -13,6 +13,7 @@ const state = {
   currentPage: "home",
   actionButtons: null,
   runtimeInfo: null,
+  watcherStatus: null,
 };
 const browserState = {
   open: false,
@@ -521,6 +522,11 @@ async function refreshBrowser(path, allowFallback = true) {
     } else {
       $("#browser-selected").textContent = "No selection";
     }
+    const hasParent = data.parent !== null && data.parent !== undefined;
+    $("#browser-up").disabled = !hasParent;
+    $("#browser-up").dataset.path = data.parent || "";
+    const canSelect = browserState.mode === "dir" ? !!browserState.currentAbs : !!browserState.selected;
+    $("#browser-select").disabled = !canSelect;
 
     list.textContent = "";
 
@@ -568,12 +574,6 @@ async function refreshBrowser(path, allowFallback = true) {
     };
 
     renderChunk();
-
-    const hasParent = data.parent !== null && data.parent !== undefined;
-    $("#browser-up").disabled = !hasParent;
-    $("#browser-up").dataset.path = data.parent || "";
-    const canSelect = browserState.mode === "dir" ? !!browserState.currentAbs : !!browserState.selected;
-    $("#browser-select").disabled = !canSelect;
   } catch (err) {
     if (allowFallback && path) {
       refreshBrowser("", false);
@@ -595,11 +595,13 @@ function applyBrowserSelection() {
     }
     const rel = browserState.path ? browserState.path : ".";
     browserState.target.value = rel;
+    console.info("Directory selected", { root: browserState.root, path: rel });
     closeBrowser();
     return;
   }
   if (browserState.selected) {
     browserState.target.value = browserState.selected;
+    console.info("File selected", { root: browserState.root, path: browserState.selected });
     closeBrowser();
   }
 }
@@ -729,13 +731,39 @@ async function refreshStatus() {
     $("#status-run-id").textContent = `run: ${data.run_id || "-"}`;
     $("#status-started").textContent = formatTimestamp(data.started_at) || "-";
     $("#status-finished").textContent = formatTimestamp(data.finished_at) || "-";
-    $("#status-error").textContent = data.error || "-";
+    const watcher = data.watcher || {};
+    const scheduler = data.scheduler || {};
+    const watcherText = watcher.enabled
+      ? (watcher.paused ? "paused (downtime)" : "enabled")
+      : "disabled";
+    $("#status-watcher").textContent = watcherText;
+    $("#status-scheduler").textContent = scheduler.enabled ? "enabled" : "disabled";
+    state.watcherStatus = watcher;
+    const scheduleNote = $("#schedule-watcher-note");
+    if (scheduleNote) {
+      scheduleNote.style.display = watcher.enabled ? "block" : "none";
+    }
 
     const status = data.status || {};
+    const failures = status.run_failures || [];
+    const watcherErrors = data.watcher_errors || [];
+    let errorText = data.error || status.last_error_message || "";
+    if (!errorText) {
+      if (status.single_download_ok === false) {
+        errorText = "Single download failed";
+      } else if (failures.length) {
+        errorText = failures[failures.length - 1];
+      } else if (watcherErrors.length) {
+        const last = watcherErrors[watcherErrors.length - 1];
+        errorText = `Watcher: ${last.playlist_id} (${last.last_error})`;
+      }
+    }
+    $("#status-error").textContent = errorText || "-";
     $("#status-success").textContent = (status.run_successes || []).length;
-    $("#status-failed").textContent = (status.run_failures || []).length;
+    $("#status-failed").textContent = failures.length;
     $("#status-playlist").textContent = status.current_playlist_id || "-";
     $("#status-video").textContent = status.current_video_title || status.current_video_id || "-";
+    $("#status-phase").textContent = status.current_phase || "-";
     if (status.last_completed) {
       const suffix = status.last_completed_at ? ` (${formatTimestamp(status.last_completed_at)})` : "";
       $("#status-last-completed").textContent = `${status.last_completed}${suffix}`;
@@ -789,14 +817,25 @@ async function refreshStatus() {
 
     const singleLink = $("#run-single-download");
     if (singleLink) {
+      const clientDeliveryId = status.client_delivery_id;
       const fileId = status.last_completed_file_id;
-      if (fileId) {
+      if (clientDeliveryId) {
+        singleLink.href = `/api/deliveries/${clientDeliveryId}/download`;
+        singleLink.textContent = "Download to device";
+        singleLink.setAttribute("aria-disabled", "false");
+      } else if (fileId) {
         singleLink.href = downloadUrl(fileId);
+        singleLink.textContent = "Download last";
         singleLink.setAttribute("aria-disabled", "false");
       } else {
         singleLink.href = "#";
+        singleLink.textContent = "Download last";
         singleLink.setAttribute("aria-disabled", "true");
       }
+    }
+    const cancelBtn = $("#status-cancel");
+    if (cancelBtn) {
+      cancelBtn.disabled = !data.running;
     }
   } catch (err) {
     setNotice($("#run-message"), `Status error: ${err.message}`, true);
@@ -1115,6 +1154,14 @@ function addPlaylistRow(entry = {}) {
       <option value="mp3">mp3</option>
     </select>
     <label class="field inline">
+      <span>Music mode</span>
+      <input class="playlist-music" type="checkbox" ${entry.music_mode ? "checked" : ""}>
+    </label>
+    <label class="field inline">
+      <span>Only download new videos (subscribe mode)</span>
+      <input class="playlist-subscribe" type="checkbox" ${entry.mode === "subscribe" ? "checked" : ""}>
+    </label>
+    <label class="field inline">
       <span>Remove after</span>
       <input class="playlist-remove" type="checkbox" ${entry.remove_after_download ? "checked" : ""}>
     </label>
@@ -1139,12 +1186,52 @@ function addPlaylistRow(entry = {}) {
 
 function renderConfig(cfg) {
   state.suppressDirty = true;
-  $("#cfg-poll-interval").value = cfg.poll_interval_minutes ?? "";
   $("#cfg-upload-date-format").value = cfg.upload_date_format ?? "";
   $("#cfg-filename-template").value = cfg.filename_template ?? "";
   $("#cfg-final-format").value = cfg.final_format ?? "";
   $("#cfg-js-runtime").value = cfg.js_runtime ?? "";
   $("#cfg-single-download-folder").value = normalizeDownloadsRelative(cfg.single_download_folder ?? "");
+  $("#cfg-music-template").value = cfg.music_filename_template ?? "";
+  $("#cfg-yt-dlp-cookies").value = cfg.yt_dlp_cookies ?? "";
+  const watcher = cfg.watcher || {};
+  const watcherEnabled = typeof watcher.enabled === "boolean" ? watcher.enabled : true;
+  const watcherToggle = $("#cfg-watcher-enabled");
+  if (watcherToggle) {
+    watcherToggle.checked = watcherEnabled;
+  }
+
+  const defaultPolicy = {
+    min_interval_minutes: 5,
+    max_interval_minutes: 360,
+    idle_backoff_factor: 2,
+    active_reset_minutes: 5,
+    downtime: {
+      enabled: false,
+      start: "23:00",
+      end: "09:00",
+      timezone: "local",
+    },
+  };
+  const policy = cfg.watch_policy || defaultPolicy;
+  const minInterval = Number.isFinite(policy.min_interval_minutes)
+    ? policy.min_interval_minutes
+    : defaultPolicy.min_interval_minutes;
+  const maxInterval = Number.isFinite(policy.max_interval_minutes)
+    ? policy.max_interval_minutes
+    : defaultPolicy.max_interval_minutes;
+  $("#cfg-watcher-min-interval").value = minInterval;
+  $("#cfg-watcher-max-interval").value = maxInterval;
+  $("#cfg-watcher-idle-backoff").value = Number.isFinite(policy.idle_backoff_factor)
+    ? policy.idle_backoff_factor
+    : defaultPolicy.idle_backoff_factor;
+  $("#cfg-watcher-active-reset").value = Number.isFinite(policy.active_reset_minutes)
+    ? policy.active_reset_minutes
+    : defaultPolicy.active_reset_minutes;
+  const downtime = policy.downtime || defaultPolicy.downtime;
+  $("#cfg-watcher-downtime-enabled").checked = !!downtime.enabled;
+  $("#cfg-watcher-downtime-start").value = downtime.start || defaultPolicy.downtime.start;
+  $("#cfg-watcher-downtime-end").value = downtime.end || defaultPolicy.downtime.end;
+  $("#cfg-watcher-downtime-timezone").value = downtime.timezone || defaultPolicy.downtime.timezone;
 
   const telegram = cfg.telegram || {};
   $("#cfg-telegram-token").value = telegram.bot_token ?? "";
@@ -1181,13 +1268,6 @@ function buildConfigFromForm() {
   const base = state.config ? JSON.parse(JSON.stringify(state.config)) : {};
   const errors = [];
 
-  const pollVal = $("#cfg-poll-interval").value.trim();
-  if (pollVal) {
-    base.poll_interval_minutes = Number(pollVal);
-  } else {
-    delete base.poll_interval_minutes;
-  }
-
   const uploadFmt = $("#cfg-upload-date-format").value.trim();
   if (uploadFmt) {
     base.upload_date_format = uploadFmt;
@@ -1214,6 +1294,67 @@ function buildConfigFromForm() {
     base.js_runtime = jsRuntime;
   } else {
     delete base.js_runtime;
+  }
+
+  const musicTemplate = $("#cfg-music-template").value.trim();
+  if (musicTemplate) {
+    base.music_filename_template = musicTemplate;
+  } else {
+    delete base.music_filename_template;
+  }
+
+  const cookiesPath = $("#cfg-yt-dlp-cookies").value.trim();
+  if (cookiesPath) {
+    base.yt_dlp_cookies = cookiesPath;
+  } else {
+    delete base.yt_dlp_cookies;
+  }
+
+  const watcherEnabled = $("#cfg-watcher-enabled").checked;
+  base.watcher = { enabled: watcherEnabled };
+  const watcherPolicy = {
+    min_interval_minutes: parseInt($("#cfg-watcher-min-interval").value, 10),
+    max_interval_minutes: parseInt($("#cfg-watcher-max-interval").value, 10),
+    idle_backoff_factor: parseInt($("#cfg-watcher-idle-backoff").value, 10),
+    active_reset_minutes: parseInt($("#cfg-watcher-active-reset").value, 10),
+    downtime: {
+      enabled: $("#cfg-watcher-downtime-enabled").checked,
+      start: $("#cfg-watcher-downtime-start").value.trim(),
+      end: $("#cfg-watcher-downtime-end").value.trim(),
+      timezone: $("#cfg-watcher-downtime-timezone").value.trim(),
+    },
+  };
+  const policyErrors = [];
+  if (!Number.isInteger(watcherPolicy.min_interval_minutes) || watcherPolicy.min_interval_minutes < 1) {
+    policyErrors.push("Watcher min interval must be an integer >= 1");
+  }
+  if (!Number.isInteger(watcherPolicy.max_interval_minutes) || watcherPolicy.max_interval_minutes < 1) {
+    policyErrors.push("Watcher max interval must be an integer >= 1");
+  }
+  if (Number.isInteger(watcherPolicy.min_interval_minutes)
+      && Number.isInteger(watcherPolicy.max_interval_minutes)
+      && watcherPolicy.max_interval_minutes < watcherPolicy.min_interval_minutes) {
+    policyErrors.push("Watcher max interval must be >= min interval");
+  }
+  if (!Number.isInteger(watcherPolicy.idle_backoff_factor) || watcherPolicy.idle_backoff_factor < 1) {
+    policyErrors.push("Watcher idle backoff factor must be an integer >= 1");
+  }
+  if (!Number.isInteger(watcherPolicy.active_reset_minutes) || watcherPolicy.active_reset_minutes < 1) {
+    policyErrors.push("Watcher active reset must be an integer >= 1");
+  }
+  if (!watcherPolicy.downtime.start) {
+    watcherPolicy.downtime.start = "23:00";
+  }
+  if (!watcherPolicy.downtime.end) {
+    watcherPolicy.downtime.end = "09:00";
+  }
+  if (!watcherPolicy.downtime.timezone) {
+    watcherPolicy.downtime.timezone = "local";
+  }
+  if (policyErrors.length) {
+    errors.push(...policyErrors);
+  } else {
+    base.watch_policy = watcherPolicy;
   }
 
   let singleFolder = $("#cfg-single-download-folder").value.trim();
@@ -1277,11 +1418,21 @@ function buildConfigFromForm() {
     } else {
       delete original.account;
     }
-  const format = row.querySelector(".playlist-format").value.trim();
+    const format = row.querySelector(".playlist-format").value.trim();
     if (format) {
       original.final_format = format;
     } else {
       delete original.final_format;
+    }
+    if (row.querySelector(".playlist-music").checked) {
+      original.music_mode = true;
+    } else {
+      delete original.music_mode;
+    }
+    if (row.querySelector(".playlist-subscribe").checked) {
+      original.mode = "subscribe";
+    } else {
+      delete original.mode;
     }
     original.remove_after_download = row.querySelector(".playlist-remove").checked;
     playlists.push(original);
@@ -1352,8 +1503,63 @@ async function startRun(payload) {
 function buildRunPayload() {
   const payload = {};
   const singleUrl = $("#run-single-url").value.trim();
+  const deliveryMode = getSingleDeliveryMode();
   if (singleUrl) {
     payload.single_url = singleUrl;
+    payload.delivery_mode = deliveryMode;
+  }
+  const destination = $("#run-destination").value.trim();
+  if (destination && deliveryMode !== "client") {
+    payload.destination = destination;
+  }
+  const finalFormat = $("#run-format").value.trim();
+  if (finalFormat) {
+    payload.final_format_override = finalFormat;
+  }
+  const jsRuntime = $("#run-js-runtime").value.trim();
+  if (jsRuntime) {
+    payload.js_runtime = jsRuntime;
+  }
+  const musicMode = $("#run-music-mode");
+  if (musicMode && musicMode.checked) {
+    payload.music_mode = true;
+  }
+  return payload;
+}
+
+function getSingleDeliveryMode() {
+  const selected = document.querySelector('input[name="run-delivery-mode"]:checked');
+  return selected ? selected.value : "server";
+}
+
+function applySingleDeliveryMode() {
+  const mode = getSingleDeliveryMode();
+  const destInput = $("#run-destination");
+  const destLabel = $("#run-destination-label");
+  const browseBtn = $("#browse-run-destination");
+  if (mode === "client") {
+    destInput.value = "";
+    destInput.disabled = true;
+    destInput.placeholder = "Download to this device";
+    browseBtn.disabled = true;
+    destLabel.textContent = "Download destination (client)";
+  } else {
+    destInput.disabled = false;
+    destInput.placeholder = "downloads";
+    browseBtn.disabled = false;
+    destLabel.textContent = "Destination (single runs)";
+  }
+}
+
+function buildPlaylistPayload() {
+  const payload = {};
+  const playlistValue = $("#run-playlist-id").value.trim();
+  if (playlistValue) {
+    payload.playlist_id = playlistValue;
+  }
+  const account = $("#run-playlist-account").value.trim();
+  if (account) {
+    payload.playlist_account = account;
   }
   const destination = $("#run-destination").value.trim();
   if (destination) {
@@ -1366,6 +1572,10 @@ function buildRunPayload() {
   const jsRuntime = $("#run-js-runtime").value.trim();
   if (jsRuntime) {
     payload.js_runtime = jsRuntime;
+  }
+  const musicMode = $("#run-music-mode");
+  if (musicMode && musicMode.checked) {
+    payload.music_mode = true;
   }
   return payload;
 }
@@ -1410,6 +1620,20 @@ function setupTimers() {
   state.timers.schedule = setInterval(() => {
     withPollingGuard(refreshSchedule);
   }, 8000);
+
+  if (state.timers.logs) {
+    clearInterval(state.timers.logs);
+  }
+  state.timers.logs = setInterval(() => {
+    const logsAuto = $("#logs-auto");
+    if (!logsAuto || !logsAuto.checked) {
+      return;
+    }
+    if (state.currentPage !== "logs") {
+      return;
+    }
+    withPollingGuard(refreshLogs);
+  }, 4000);
 }
 
 function bindEvents() {
@@ -1448,6 +1672,11 @@ function bindEvents() {
   });
 
   $("#logs-refresh").addEventListener("click", refreshLogs);
+  $("#logs-auto").addEventListener("change", () => {
+    if ($("#logs-auto").checked) {
+      refreshLogs();
+    }
+  });
   $("#downloads-refresh").addEventListener("click", refreshDownloads);
   $("#downloads-apply").addEventListener("click", refreshDownloads);
   $("#downloads-clear").addEventListener("click", async () => {
@@ -1498,6 +1727,10 @@ function bindEvents() {
   $("#browse-run-destination").addEventListener("click", () => {
     const input = $("#run-destination");
     openBrowser(input, "downloads", "dir", "", resolveBrowseStart("downloads", input.value));
+  });
+  $("#browse-yt-dlp-cookies").addEventListener("click", () => {
+    const input = $("#cfg-yt-dlp-cookies");
+    openBrowser(input, "tokens", "file", ".txt", resolveBrowseStart("tokens", input.value));
   });
 
   $("#toggle-telegram-token").addEventListener("click", () => {
@@ -1556,10 +1789,34 @@ function bindEvents() {
     const payload = jsRuntime ? { js_runtime: jsRuntime } : {};
     startRun(payload);
   });
+  $("#status-cancel").addEventListener("click", async () => {
+    const ok = confirm("Are you sure you want to kill downloads in progress?");
+    if (!ok) {
+      return;
+    }
+    try {
+      await fetchJson("/api/cancel", { method: "POST" });
+      setNotice($("#run-message"), "Cancel requested", false);
+      await refreshStatus();
+    } catch (err) {
+      setNotice($("#run-message"), `Cancel failed: ${err.message}`, true);
+    }
+  });
+  $$('input[name="run-delivery-mode"]').forEach((input) => {
+    input.addEventListener("change", applySingleDeliveryMode);
+  });
   $("#run-single").addEventListener("click", () => {
     const payload = buildRunPayload();
     if (!payload.single_url) {
       setNotice($("#run-message"), "Single URL is required", true);
+      return;
+    }
+    startRun(payload);
+  });
+  $("#run-playlist-once").addEventListener("click", () => {
+    const payload = buildPlaylistPayload();
+    if (!payload.playlist_id) {
+      setNotice($("#run-message"), "Playlist URL or ID is required", true);
       return;
     }
     startRun(payload);
@@ -1597,6 +1854,8 @@ function bindEvents() {
       updatePollingState();
     });
   }
+
+  applySingleDeliveryMode();
 }
 
 async function init() {
@@ -1613,8 +1872,8 @@ async function init() {
   setupTimers();
   const logsAuto = $("#logs-auto");
   if (logsAuto) {
-    logsAuto.checked = false;
-    logsAuto.disabled = true;
+    logsAuto.checked = true;
+    logsAuto.disabled = false;
   }
 }
 
