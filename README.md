@@ -1,12 +1,31 @@
 # Retreivr
 
-Retreivr is a self-hosted tool for archiving YouTube playlists or individual videos with a clean Web UI, a simple API, and a Docker-first deployment model. For most users, the recommended install and best experience is the Docker container.
+<p align="center">
+  <img src="webUI/app_icon.png" width="128" />
+</p>
 
+<h1 align="center">Retreivr</h1>
+
+<p align="center">
+  Self-hosted media search, scoring, and archival engine
+</p>
+
+## Overview
+Retreivr is an Open-Source Media Search and Download tool designed to streamline the user's search for freely-available media content and give them the power to quickly find new content for their self-hosted Media Library, while staying privacy-focused, fully in control, and easy to use. 
+
+My vision for this tool is not to replace any Library-Management software or Media-Players, but to be the premier application for searching for new content to collect. First-stop for new content on any self-hosted media library.
+
+Already this project boasts a clean Web UI, a simple API, and a Docker-first deployment model. 
+For most users, the recommended install and best experience is the Docker container.
+
+## History
 Retreivr is the evolution of the former YouTube-Archiver project.
 The project has been renamed and repositioned to reflect its broader role as a controlled media discovery and library seeding system.
+
 Version v0.9.0 is the first release under the Retreivr name.
 
-It’s designed to run unattended, keep history in a local SQLite database, and let you inspect status, logs, and completed downloads from a browser. Files are downloaded to disk once and can be streamed or downloaded directly to your device via the Web UI.
+## Functionality
+It’s designed to run unattended, keep history in a local SQLite database, and let you inspect status, logs, and completed downloads from a browser. Files are downloaded to disk once and can be downloaded to the server or downloaded directly to your device via the Web UI.
 
 This is not a cloud service and it does not require any hosted components.
 
@@ -29,6 +48,11 @@ Highlights
 	•	Optional Basic auth and reverse-proxy support
 	•	Home Assistant–friendly status and metrics endpoints
 
+## Screenshots
+
+### Home Page
+![Home Page](webUI/assets/screenshots/screenshot_1.png)
+
 ## Quick start (Docker - recommended)
 Pull the prebuilt image from GHCR:
 ```bash
@@ -43,6 +67,17 @@ cp .env.example .env
 docker compose -f docker/docker-compose.yml up -d
 ```
 Open the Web UI at `http://YOUR_HOST:8090`.
+
+OR clone from Github:
+
+## Quick Start
+
+```bash
+git clone https://github.com/Retreivr/retreivr.git
+cd retreivr
+cp docker-compose.yml.example docker-compose.yml
+docker compose up -d
+```
 
 ## Requirements
 Docker deployment:

@@ -1,36 +1,14 @@
 # Changelog
 All notable changes to this project will be documented here.
 
-## [v0.9.0] – Retreivr Rebrand Release
-
-### Summary
-This release marks the official rebrand of the project from **YouTube-Archiver** to **Retreivr**.
-The version number has been reset to reflect a new product identity and roadmap.
-
-### Important Notes
-- v1.2.0 was the **final release** under the YouTube-Archiver name.
-- Versioning resumes at v0.9.0 under the Retreivr name.
-- Functionality is unchanged in this release.
-- Future releases may introduce breaking changes as APIs, environment variables, and UI contracts are stabilized.
-
-### Changes
+## [v0.9.0] – Retreivr Rebrand Release // Music Mode and Metadata
 - Project renamed to Retreivr
 - Repository migrated to new namespace
 - Branding updated across documentation, UI, and Docker artifacts
-- Environment variables remain `YT_ARCHIVER_*` in this release
-- No functional behavior changes
 
----
-
-## [v1.2.0] – Final YouTube-Archiver Release
-
-### Summary
-Final release published under the YouTube-Archiver name before rebranding.
-
-### Changes
-1.3.0 - Music Mode and Metadata
 Added:
 - Music mode (opt-in per playlist and per single-URL run) with audio-focused metadata and music-safe naming.
+- Smart Search feature - aggregating results from multiple top-tier sources and scoring quality and metadata acquisition, ranking results, and simplifying the entire media-searching process for users.
 - yt-dlp cookies support (Netscape cookies.txt) for improved YouTube Music metadata.
 - Music filename template support (artist/album/track hierarchy).
 - Music metadata enrichment pipeline (MusicBrainz + optional AcoustID + artwork) with background tagging.
@@ -54,6 +32,30 @@ Changed:
 - Downloads respect downtime windows and defer until downtime ends.
 - Watcher batches detections with a quiet-window strategy and sends one Telegram summary per batch.
 - Status now reports current phase and last error for active runs.
+
+### Summary
+This v00.9.0 release marks the official rebrand of the project from **YouTube-Archiver** to **Retreivr**.
+The version number has been reset to reflect a new product identity and roadmap.
+
+### Important Notes
+- v1.2.0 was the **final release** under the YouTube-Archiver name.
+- Versioning resumes at v0.9.0 under the Retreivr name.
+- Functionality is unchanged in this release.
+- Future releases may introduce breaking changes as APIs, environment variables, and UI contracts are stabilized.
+
+|vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv|
+|##################################|
+|//////////////////////////////////|
+|\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\|
+|##################################|
+|^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^|
+
+## [v1.2.0] – Final YouTube-Archiver Release
+
+### Summary
+Final release published under the YouTube-Archiver name before rebranding.
+
+### Changes
 
 1.2.0 - OAuth Web UI Helper
 Added:
