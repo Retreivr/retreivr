@@ -4,8 +4,6 @@
   <img src="webUI/app_icon.png" width="128" />
 </p>
 
-<h1 align="center">Retreivr</h1>
-
 <p align="center">
   Self-hosted media search, scoring, and archival engine
 </p>

@@ -34,7 +34,7 @@ Changed:
 - Status now reports current phase and last error for active runs.
 
 ### Summary
-This v00.9.0 release marks the official rebrand of the project from **YouTube-Archiver** to **Retreivr**.
+This v0.9.0 release marks the official rebrand of the project from **YouTube-Archiver** to **Retreivr**.
 The version number has been reset to reflect a new product identity and roadmap.
 
 ### Important Notes
