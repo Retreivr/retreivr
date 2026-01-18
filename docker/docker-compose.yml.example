@@ -7,10 +7,10 @@ services:
       - "8090:8000"
     environment:
       # Defaults match the container's internal layout; override if needed.
-      - YT_ARCHIVER_DOWNLOADS_DIR=/downloads
-      - YT_ARCHIVER_DATA_DIR=/data
-      - YT_ARCHIVER_LOG_DIR=/logs
-      - YT_ARCHIVER_TOKENS_DIR=/tokens
+      - RETREIVR_DOWNLOADS_DIR=/downloads
+      - RETREIVR_DATA_DIR=/data
+      - RETREIVR_LOG_DIR=/logs
+      - RETREIVR_TOKENS_DIR=/tokens
     volumes:
       # Map downloads to your media storage location.
       - ./downloads:/downloads

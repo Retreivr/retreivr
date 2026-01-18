@@ -1,0 +1,35 @@
+name: Build Windows Desktop Launcher
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri deps
+        run: npm install
+        working-directory: launcher
+
+      - name: Build Tauri app
+        run: npm run tauri build
+        working-directory: launcher
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: retreivr-windows-exe
+          path: launcher/src-tauri/target/release/bundle/msi/*.msi

@@ -2,7 +2,7 @@ import logging
 import os
 
 from mutagen import File as MutagenFile
-from mutagen.id3 import APIC, ID3, TCON, TDRC, TIT2, TPE1, TPE2, TALB, TRCK, TXXX
+from mutagen.id3 import APIC, ID3, TCON, TDRC, TIT2, TPE1, TPE2, TALB, TRCK, TXXX, USLT
 from mutagen.mp4 import MP4, MP4Cover
 
 
@@ -38,6 +38,13 @@ def _apply_id3_tags(file_path, tags, artwork, source_title, allow_overwrite):
         changed |= _set_id3_txxx(audio, "SOURCE_TITLE", source_title, allow_overwrite)
     if tags.get("recording_id"):
         changed |= _set_id3_txxx(audio, "MBID", tags.get("recording_id"), allow_overwrite)
+    lyrics = tags.get("lyrics")
+    if lyrics:
+        if allow_overwrite:
+            audio.delall("USLT")
+        if allow_overwrite or not audio.getall("USLT"):
+            audio.add(USLT(encoding=3, lang="eng", desc="Lyrics", text=str(lyrics)))
+            changed = True
     if artwork and (allow_overwrite or not audio.getall("APIC")):
         if allow_overwrite:
             for frame in audio.getall("APIC"):
@@ -63,6 +70,7 @@ def _apply_mp4_tags(file_path, tags, artwork, source_title, allow_overwrite):
     changed |= _set_mp4_value(mp4_tags, "\xa9ART", tags.get("artist"), allow_overwrite)
     changed |= _set_mp4_value(mp4_tags, "\xa9alb", tags.get("album"), allow_overwrite)
     changed |= _set_mp4_value(mp4_tags, "\xa9nam", tags.get("title"), allow_overwrite)
+    changed |= _set_mp4_value(mp4_tags, "\xa9lyr", tags.get("lyrics"), allow_overwrite)
     changed |= _set_mp4_value(mp4_tags, "aART", tags.get("album_artist"), allow_overwrite)
     track_number = _normalize_track(tags.get("track_number"))
     if track_number and (allow_overwrite or "trkn" not in mp4_tags):
@@ -103,6 +111,7 @@ def _apply_generic_tags(file_path, tags, artwork, source_title, allow_overwrite)
     changed |= _set_generic(audio.tags, "artist", tags.get("artist"), allow_overwrite)
     changed |= _set_generic(audio.tags, "album", tags.get("album"), allow_overwrite)
     changed |= _set_generic(audio.tags, "title", tags.get("title"), allow_overwrite)
+    changed |= _set_generic(audio.tags, "lyrics", tags.get("lyrics"), allow_overwrite)
     changed |= _set_generic(audio.tags, "albumartist", tags.get("album_artist"), allow_overwrite)
     changed |= _set_generic(audio.tags, "tracknumber", tags.get("track_number"), allow_overwrite)
     changed |= _set_generic(audio.tags, "date", tags.get("year"), allow_overwrite)

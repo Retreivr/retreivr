@@ -8,6 +8,7 @@ from .providers import acoustid as acoustid_provider
 from .providers import artwork as artwork_provider
 from .providers import musicbrainz as musicbrainz_provider
 from .tagger import apply_tags
+from .lyric_enrichment import fetch_lyrics
 
 
 class MetadataWorker(threading.Thread):
@@ -100,6 +101,22 @@ def _process_item(item):
         display_title,
         display_album,
     )
+
+    # Optional lyrics enrichment (non-fatal)
+    if config.get("enable_lyrics"):
+        try:
+            lyrics_result = fetch_lyrics(
+                artist=tags.get("artist") or "",
+                title=tags.get("title") or "",
+                album=tags.get("album"),
+                config=config,
+            )
+            if lyrics_result and lyrics_result.lyrics:
+                tags["lyrics"] = lyrics_result.lyrics
+                tags["lyrics_source"] = lyrics_result.source
+                tags["lyrics_confidence"] = lyrics_result.confidence
+        except Exception:
+            logging.exception("Lyrics enrichment failed (non-fatal)")
 
     dry_run = bool(config.get("dry_run"))
     apply_tags(

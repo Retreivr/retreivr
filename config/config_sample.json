@@ -48,7 +48,9 @@
     "allow_overwrite_tags": true,
     "max_artwork_size_px": 1500,
     "rate_limit_seconds": 1.5,
-    "dry_run": false
+    "dry_run": false,
+    "enable_lyrics": true,
+    "genius_api_token": "…"
   },
   "music_metadata_debug": false,
   "dry_run": false,

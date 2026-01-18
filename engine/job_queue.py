@@ -142,14 +142,20 @@ def ensure_download_jobs_table(conn):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_download_jobs_created ON download_jobs (created_at)")
     conn.commit()
 
-
 def is_music_media_type(value):
     if value is None:
         return False
     value = str(value).strip().lower()
     return value in {"music", "audio"}
 
-
+def _normalize_audio_format(value: str | None) -> str | None:
+    if not value:
+        return None
+    v = str(value).strip().lower()
+    # Accept mp4 as a user-facing synonym for m4a (AAC in MP4 container)
+    if v == "mp4":
+        return "m4a"
+    return v
 
 class DownloadJobStore:
     def __init__(self, db_path):
@@ -576,9 +582,7 @@ class YouTubeAdapter:
         output_template = job.output_template or {}
         output_dir = output_template.get("output_dir") or paths.single_downloads_dir
         audio_mode = is_music_media_type(job.media_type)
-        final_format = output_template.get("final_format")
-        if isinstance(final_format, str):
-            final_format = final_format.strip().lower()
+        final_format = _normalize_audio_format(output_template.get("final_format"))
         if audio_mode:
             if not final_format or final_format not in _AUDIO_FORMATS:
                 if final_format:
@@ -791,7 +795,7 @@ def build_ytdlp_opts(context):
 
 
 def _build_audio_postprocessors(target_format):
-    preferred = (target_format or "mp3").lower()
+    preferred = _normalize_audio_format(target_format) or "mp3"
     if preferred not in _AUDIO_FORMATS:
         logging.warning("Unsupported audio format %s; defaulting to mp3", preferred)
         preferred = "mp3"

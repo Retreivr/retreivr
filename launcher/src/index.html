@@ -1,0 +1,14 @@
+<file name=main.rs path=/Users/Shared/NFS/Homes/mikesell/Projects/retreivr/launcher/src-tauri/src/main.rs>fn main() {
+    println!("Retreivr launcher backend started with compose support");
+
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            docker_available,
+            compose_exists,
+            container_running,
+            install_retreivr,
+            stop_retreivr
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

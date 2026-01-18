@@ -216,9 +216,9 @@ docker compose up -d
 This preserves your config, database, logs, tokens, and downloads.
 
 ## Versioning (Docker builds)
-The app reads its version from `YT_ARCHIVER_VERSION`. The Dockerfile exposes a build arg:
+The app reads its version from `RETREIVR_VERSION`. The Dockerfile exposes a build arg:
 ```bash
-docker build -f docker/Dockerfile --build-arg YT_ARCHIVER_VERSION=0.9.0 -t retreivr:latest .
+docker build -f docker/Dockerfile --build-arg RETRIEVR_VERSION=0.9.0 -t retreivr:latest .
 ```
 This avoids keeping the version in Compose or runtime envs.
 
@@ -246,7 +246,7 @@ This project does not attempt to:
 - Downloads are staged in a temp directory and atomically copied to their final location  
 - “Clear temporary files” only removes working directories (temp downloads + yt-dlp temp)  
 - “Update yt-dlp” runs in-container and requires a container restart to take effect  
-- YT_ARCHIVER_* environment variables can override paths (see .env.example)  
+- RETREIVR_* environment variables can override paths (see .env.example)  
 
 ## Release
 See `CHANGELOG.md` for details of the current release and history.
