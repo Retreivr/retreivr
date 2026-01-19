@@ -346,10 +346,10 @@ class SearchJobStore:
             cur.execute(query, params)
             rows = []
             for row in cur.fetchall():
-            entry = dict(row)
-            entry["source_priority"] = _parse_source_priority(row["source_priority_json"])
-            entry["resolved_destination"] = self._resolve_request_destination(entry.get("destination_dir"))
-            rows.append(entry)
+                entry = dict(row)
+                entry["source_priority"] = _parse_source_priority(row["source_priority_json"])
+                entry["resolved_destination"] = self._resolve_request_destination(entry.get("destination_dir"))
+                rows.append(entry)
             return rows
         finally:
             conn.close()

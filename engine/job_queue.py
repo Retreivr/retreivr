@@ -446,6 +446,7 @@ class DownloadJobStore:
             return self._row_to_job(updated_row)
         finally:
             conn.close()
+            
     def mark_completed(self, job_id):
         now = utc_now()
         conn = self._connect()
