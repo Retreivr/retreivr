@@ -103,6 +103,7 @@ class DownloadJob:
     output_template: dict | None
     resolved_destination: str | None
     canonical_id: str | None
+    file_path: str | None
 
 
 def utc_now():
@@ -142,7 +143,8 @@ def ensure_download_jobs_table(conn):
             trace_id TEXT NOT NULL UNIQUE,
             output_template TEXT,
             resolved_destination TEXT,
-            canonical_id TEXT
+            canonical_id TEXT,
+            file_path TEXT
         )
         """
     )
@@ -154,6 +156,7 @@ def ensure_download_jobs_table(conn):
         "postprocessing",
         "resolved_destination",
         "canonical_id",
+        "file_path",
     ):
         if column not in existing_columns:
             cur.execute(f"ALTER TABLE download_jobs ADD COLUMN {column} TEXT")
@@ -229,6 +232,7 @@ class DownloadJobStore:
             output_template=parsed_output,
             resolved_destination=row["resolved_destination"],
             canonical_id=row["canonical_id"],
+            file_path=row.get("file_path"),
         )
 
     def list_sources_with_queued_jobs(self, *, now=None):
@@ -276,6 +280,21 @@ class DownloadJobStore:
         finally:
             conn.close()
 
+    def _row_has_valid_output(self, row):
+        if not row:
+            return False
+        if row["status"] != JOB_STATUS_COMPLETED:
+            return False
+        path = row.get("file_path")
+        if not path:
+            return False
+        try:
+            if not os.path.exists(path):
+                return False
+            return os.path.getsize(path) > 0
+        except OSError:
+            return False
+
     def find_duplicate_job(self, *, canonical_id=None, url=None, destination=None):
         if not canonical_id and not url:
             return None
@@ -299,14 +318,50 @@ class DownloadJobStore:
                 return None
             query = f"""
                 SELECT * FROM download_jobs
-                WHERE ({' OR '.join(clauses)}) AND status!=?
+                WHERE ({' OR '.join(clauses)}) AND status=?
                 ORDER BY created_at DESC
                 LIMIT 1
             """
-            params.append(JOB_STATUS_FAILED)
+            params.append(JOB_STATUS_COMPLETED)
             cur.execute(query, tuple(params))
             row = cur.fetchone()
+            if not row or not self._row_has_valid_output(row):
+                return None
             return self._row_to_job(row)
+        finally:
+            conn.close()
+
+    def claim_job_by_id(self, job_id, *, now=None):
+        now = now or utc_now()
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute(
+                "SELECT * FROM download_jobs WHERE id=? AND status=? LIMIT 1",
+                (job_id, JOB_STATUS_QUEUED),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.commit()
+                return None
+            cur.execute(
+                """
+                UPDATE download_jobs
+                SET status=?, claimed=?, updated_at=?
+                WHERE id=? AND status=?
+                """,
+                (JOB_STATUS_CLAIMED, now, now, job_id, JOB_STATUS_QUEUED),
+            )
+            if cur.rowcount != 1:
+                conn.commit()
+                return None
+            conn.commit()
+            updated_row = dict(row)
+            updated_row["status"] = JOB_STATUS_CLAIMED
+            updated_row["claimed"] = now
+            updated_row["updated_at"] = now
+            return self._row_to_job(updated_row)
         finally:
             conn.close()
 
@@ -324,6 +379,7 @@ class DownloadJobStore:
         trace_id=None,
         resolved_destination=None,
         canonical_id=None,
+        log_duplicate_event=True,
     ):
         origin_id = origin_id or ""
         destination = resolved_destination
@@ -336,19 +392,20 @@ class DownloadJobStore:
             destination=destination,
         )
         if duplicate:
-            _log_event(
-                logging.INFO,
-                "job_skipped_duplicate",
-                job_id=duplicate.id,
-                trace_id=duplicate.trace_id,
-                origin=origin,
-                origin_id=origin_id,
-                source=source,
-                url=url,
-                destination=destination,
-                canonical_id=canonical_id,
-                status=duplicate.status,
-            )
+            if log_duplicate_event:
+                _log_event(
+                    logging.INFO,
+                    "job_skipped_duplicate",
+                    job_id=duplicate.id,
+                    trace_id=duplicate.trace_id,
+                    origin=origin,
+                    origin_id=origin_id,
+                    source=source,
+                    url=url,
+                    destination=destination,
+                    canonical_id=canonical_id,
+                    status=duplicate.status,
+                )
             return duplicate.id, False, "duplicate"
 
         job_id = uuid4().hex
@@ -447,19 +504,29 @@ class DownloadJobStore:
         finally:
             conn.close()
             
-    def mark_completed(self, job_id):
+    def mark_completed(self, job_id, *, file_path=None):
         now = utc_now()
         conn = self._connect()
         try:
             cur = conn.cursor()
-            cur.execute(
-                """
-                UPDATE download_jobs
-                SET status=?, completed=?, updated_at=?
-                WHERE id=?
-                """,
-                (JOB_STATUS_COMPLETED, now, now, job_id),
-            )
+            if file_path:
+                cur.execute(
+                    """
+                    UPDATE download_jobs
+                    SET status=?, completed=?, updated_at=?, file_path=?
+                    WHERE id=?
+                    """,
+                    (JOB_STATUS_COMPLETED, now, now, file_path, job_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE download_jobs
+                    SET status=?, completed=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (JOB_STATUS_COMPLETED, now, now, job_id),
+                )
             conn.commit()
         finally:
             conn.close()
@@ -663,7 +730,14 @@ class DownloadWorkerEngine:
             media_intent=job.media_intent,
         )
         try:
-            result = adapter.execute(job, self.config, self.paths, stop_event=stop_event)
+            result = adapter.execute(
+                job,
+                self.config,
+                self.paths,
+                stop_event=stop_event,
+                media_type=job.media_type,
+                media_intent=job.media_intent,
+            )
             if not result:
                 raise RuntimeError("adapter_execute_failed")
             final_path, meta = result
@@ -674,7 +748,7 @@ class DownloadWorkerEngine:
                 final_path,
                 meta=meta,
             )
-            self.store.mark_completed(job.id)
+            self.store.mark_completed(job.id, file_path=final_path)
             _log_event(
                 logging.INFO,
                 "job_completed",
@@ -709,7 +783,7 @@ class DownloadWorkerEngine:
 
 
 class YouTubeAdapter:
-    def execute(self, job, config, paths, *, stop_event=None):
+    def execute(self, job, config, paths, *, stop_event=None, media_type=None, media_intent=None):
         output_template = job.output_template or {}
         output_dir = output_template.get("output_dir") or paths.single_downloads_dir
         raw_final_format = output_template.get("final_format")
@@ -739,6 +813,11 @@ class YouTubeAdapter:
                 final_format=final_format,
                 cookie_file=cookie_file,
                 stop_event=stop_event,
+                media_type=media_type,
+                media_intent=media_intent,
+                job_id=job.id,
+                origin=job.origin,
+                resolved_destination=job.resolved_destination,
             )
             if not info or not local_file:
                 shutil.rmtree(temp_dir, ignore_errors=True)
@@ -765,6 +844,18 @@ class YouTubeAdapter:
             os.makedirs(os.path.dirname(final_path), exist_ok=True)
             atomic_move(local_file, final_path)
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+            size = None
+            try:
+                size = os.path.getsize(final_path)
+            except OSError:
+                size = None
+            if size is None or size == 0:
+                try:
+                    os.remove(final_path)
+                except OSError:
+                    pass
+                raise RuntimeError("empty_output_file")
 
             if audio_mode:
                 enqueue_media_metadata(final_path, meta, config)
@@ -824,9 +915,8 @@ def resolve_media_type(config, *, playlist_entry=None, url=None):
             legacy_audio = config.get("music_mode")
     if legacy_audio is True:
         return "music"
-    if url and is_youtube_music_url(url):
-        return "music"
-    return "music"
+    # Invariant A: default to video when no explicit media_type is provided.
+    return "video"
 
 
 def resolve_media_intent(origin, media_type, *, playlist_entry=None):
@@ -895,7 +985,7 @@ def build_ytdlp_opts(context):
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": True,
+        "noplaylist": operation != "playlist",
         "outtmpl": output_template,
         "retries": 3,
         "fragment_retries": 3,
@@ -912,18 +1002,47 @@ def build_ytdlp_opts(context):
     elif operation == "metadata":
         opts["skip_download"] = True
     else:
-        opts["format"] = _FORMAT_AUDIO if audio_mode else _FORMAT_VIDEO
         if audio_mode:
-            opts["postprocessors"] = _build_audio_postprocessors(target_format)
+            normalized_audio = _normalize_audio_format(target_format)
+            if normalized_audio and normalized_audio in _AUDIO_FORMATS:
+                opts["postprocessors"] = _build_audio_postprocessors(normalized_audio)
+            else:
+                opts["postprocessors"] = _build_audio_postprocessors(None)
+            opts["format"] = _FORMAT_AUDIO
             opts["addmetadata"] = True
             opts["embedthumbnail"] = True
             opts["writethumbnail"] = True
+        else:
+            normalized = _normalize_format(target_format)
+            if normalized in {"webm", "mp4", "mkv"}:
+                opts["format"] = "bestvideo+bestaudio/best"
+                opts["merge_output_format"] = normalized
+            elif normalized:
+                opts["format"] = normalized
+            else:
+                opts["format"] = _FORMAT_VIDEO
 
-    opts = _merge_overrides(opts, overrides, operation=operation)
+    opts = _merge_overrides(opts, overrides, operation=operation, lock_format=bool(target_format))
 
     if operation == "download":
         for key in _YTDLP_DOWNLOAD_UNSAFE_KEYS:
             opts.pop(key, None)
+
+    _log_event(
+        logging.INFO,
+        "audit_build_ytdlp_opts",
+        operation=operation,
+        format=opts.get("format"),
+        audio_mode=audio_mode,
+        media_type=context.get("media_type"),
+        media_intent=context.get("media_intent"),
+        final_format=target_format,
+        postprocessors=bool(opts.get("postprocessors")),
+        addmetadata=opts.get("addmetadata"),
+        embedthumbnail=opts.get("embedthumbnail"),
+        writethumbnail=opts.get("writethumbnail"),
+        overrides=context.get("overrides"),
+    )
 
     return opts
 
@@ -942,7 +1061,7 @@ def _build_audio_postprocessors(target_format):
     ]
 
 
-def _merge_overrides(opts, overrides, *, operation):
+def _merge_overrides(opts, overrides, *, operation, lock_format=False):
     if not isinstance(overrides, dict):
         return opts
     unsafe = [key for key in overrides if key in _YTDLP_DOWNLOAD_UNSAFE_KEYS]
@@ -953,8 +1072,36 @@ def _merge_overrides(opts, overrides, *, operation):
             continue
         if operation == "download" and key not in _YTDLP_DOWNLOAD_ALLOWLIST:
             continue
+        if lock_format and key in {"format", "merge_output_format"}:
+            continue
         opts[key] = value
     return opts
+
+
+def _redact_ytdlp_opts(opts):
+    redacted = {}
+    for key, value in (opts or {}).items():
+        if key in {"cookiefile", "cookiesfrombrowser"}:
+            redacted[key] = "<redacted>"
+            continue
+        if key in {"http_headers", "headers"}:
+            redacted[key] = "<redacted>"
+            continue
+        redacted[key] = value
+    return redacted
+
+
+def _format_summary(info):
+    if not isinstance(info, dict):
+        return {"format_count": 0, "exts": [], "has_webm": False}
+    formats = info.get("formats") or []
+    ext_set = {fmt.get("ext") for fmt in formats if fmt.get("ext")}
+    exts = sorted(ext_set)
+    return {
+        "format_count": len(formats),
+        "exts": exts,
+        "has_webm": "webm" in ext_set,
+    }
 
 
 def download_with_ytdlp(
@@ -966,6 +1113,11 @@ def download_with_ytdlp(
     final_format,
     cookie_file=None,
     stop_event=None,
+    media_type=None,
+    media_intent=None,
+    job_id=None,
+    origin=None,
+    resolved_destination=None,
 ):
     if stop_event and stop_event.is_set():
         return None, None
@@ -977,14 +1129,96 @@ def download_with_ytdlp(
         "output_template": output_template,
         "cookie_file": cookie_file,
         "overrides": (config or {}).get("yt_dlp_opts") or {},
+        "media_type": media_type,
+        "media_intent": media_intent,
     }
     opts = build_ytdlp_opts(context)
+
+    _log_event(
+        logging.INFO,
+        "FINAL_YTDLP_OPTS",
+        job_id=job_id,
+        url=url,
+        origin=origin,
+        media_type=media_type,
+        media_intent=media_intent,
+        audio_mode=audio_mode,
+        resolved_destination=resolved_destination,
+        final_format=final_format,
+        format=opts.get("format"),
+        merge_output_format=opts.get("merge_output_format"),
+        outtmpl=opts.get("outtmpl"),
+        noplaylist=opts.get("noplaylist"),
+        postprocessors=opts.get("postprocessors"),
+        cookiefile=opts.get("cookiefile"),
+        opts=_redact_ytdlp_opts(opts),
+    )
 
     info = None
     try:
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
     except Exception as exc:
+        _log_event(
+            logging.ERROR,
+            "YTDLP_FAILED",
+            job_id=job_id,
+            url=url,
+            origin=origin,
+            media_type=media_type,
+            media_intent=media_intent,
+            audio_mode=audio_mode,
+            final_format=final_format,
+            format=opts.get("format"),
+            merge_output_format=opts.get("merge_output_format"),
+            outtmpl=opts.get("outtmpl"),
+            noplaylist=opts.get("noplaylist"),
+            error=str(exc),
+            opts=_redact_ytdlp_opts(opts),
+        )
+        _log_event(
+            logging.ERROR,
+            "ytdlp_download_failed",
+            job_id=job_id,
+            url=url,
+            origin=origin,
+            media_type=media_type,
+            media_intent=media_intent,
+            audio_mode=audio_mode,
+            final_format=final_format,
+            format=opts.get("format"),
+            merge_output_format=opts.get("merge_output_format"),
+            outtmpl=opts.get("outtmpl"),
+            noplaylist=opts.get("noplaylist"),
+            error=str(exc),
+        )
+        if "Requested format is not available" in str(exc):
+            try:
+                list_opts = dict(opts)
+                list_opts["skip_download"] = True
+                with YoutubeDL(list_opts) as ydl:
+                    info_probe = ydl.extract_info(url, download=False)
+                summary = _format_summary(info_probe)
+                _log_event(
+                    logging.ERROR,
+                    "ytdlp_format_summary",
+                    job_id=job_id,
+                    url=url,
+                    format=opts.get("format"),
+                    merge_output_format=opts.get("merge_output_format"),
+                    format_count=summary["format_count"],
+                    exts=summary["exts"],
+                    has_webm=summary["has_webm"],
+                )
+            except Exception as probe_exc:
+                _log_event(
+                    logging.ERROR,
+                    "ytdlp_format_summary_failed",
+                    job_id=job_id,
+                    url=url,
+                    format=opts.get("format"),
+                    error=str(probe_exc),
+                )
         raise RuntimeError(f"yt_dlp_download_failed: {exc}")
 
     if stop_event and stop_event.is_set():

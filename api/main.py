@@ -67,6 +67,7 @@ from engine.core import (
     mark_video_seen,
     playlist_has_seen,
     read_history,
+    run_direct_url_self_test,
     run_archive,
     run_single_playlist,
     telegram_notify,
@@ -237,7 +238,7 @@ class OAuthCompleteRequest(BaseModel):
 class SearchRequestPayload(BaseModel):
     created_by: str | None = None
     intent: str
-    media_type: str | None = "music"
+    media_type: str | None = "generic"
     artist: str
     album: str | None = None
     track: str | None = None
@@ -358,6 +359,16 @@ async def startup():
         config=config or {},
         paths=app.state.paths,
     )
+    if os.environ.get("RETREIVR_DIAG", "").strip().lower() in {"1", "true", "yes"}:
+        diag_url = os.environ.get("RETREIVR_DIAG_URL", "https://youtu.be/PmtGDk0c-JM")
+        logging.info("RETREIVR_DIAG enabled; running direct URL self-test")
+        await anyio.to_thread.run_sync(
+            run_direct_url_self_test,
+            config or {},
+            paths=app.state.paths,
+            url=diag_url,
+            final_format_override="webm",
+        )
     app.state.spotify_playlist_importer = SpotifyPlaylistImporter()
     app.state.spotify_import_status = {}
 
@@ -1053,20 +1064,20 @@ async def _start_run_with_config(
                     )
                 else:
                     run_callable = functools.partial(
-                    run_archive,
-                    config,
-                    paths=app.state.paths,
-                    status=status,
-                    single_url=single_url,
-                    destination=destination,
-                    final_format_override=final_format_override,
-                    js_runtime_override=js_runtime,
-                    stop_event=app.state.stop_event,
-                    run_source=run_source,
-                    music_mode=bool(music_mode) if music_mode is not None else False,
-                    skip_downtime=skip_downtime,
-                    delivery_mode=delivery_mode or "server",
-                )
+                        run_archive,
+                        config,
+                        paths=app.state.paths,
+                        status=status,
+                        single_url=single_url,
+                        destination=destination,
+                        final_format_override=final_format_override,
+                        js_runtime_override=js_runtime,
+                        stop_event=app.state.stop_event,
+                        run_source=run_source,
+                        music_mode=bool(music_mode) if music_mode is not None else False,
+                        skip_downtime=skip_downtime,
+                        delivery_mode=delivery_mode or "server",
+                    )
                 await anyio.to_thread.run_sync(run_callable)
                 if app.state.stop_event.is_set():
                     if app.state.cancel_requested:

@@ -28,6 +28,7 @@ const state = {
   homeBestScores: {},
   homeCandidateCache: {},
   homeCandidatesLoading: {},
+  homeSearchPollStart: null,
   homeSearchControlsEnabled: true,
   pendingAdvancedRequestId: null,
   spotifyPlaylistStatus: {},
@@ -91,6 +92,7 @@ const HOME_STATUS_CLASS_MAP = {
   skipped: "failed",
 };
 const HOME_FINAL_STATUSES = new Set(["completed", "completed_with_skips", "failed"]);
+const HOME_RESULT_TIMEOUT_MS = 18000;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -1543,6 +1545,7 @@ function stopHomeResultPolling() {
     clearInterval(state.homeResultsTimer);
     state.homeResultsTimer = null;
   }
+  state.homeSearchPollStart = null;
 }
 
 function setHomeResultsStatus(text) {
@@ -1582,7 +1585,8 @@ function buildHomeResultsStatusInfo(requestId) {
   const bestScore = state.homeBestScores[requestId];
   const bestText = Number.isFinite(bestScore) ? bestScore.toFixed(2) : "calculating…";
   const hasCandidates = items.some((item) => item.candidate_count > 0);
-  const hasQueued = items.some((item) => ["selected", "enqueued"].includes(item.status));
+  const allowQueued = state.homeSearchMode !== "searchOnly";
+  const hasQueued = allowQueued && items.some((item) => ["enqueued", "skipped"].includes(item.status));
 
   if (requestStatus === "failed" && error && error !== "no_items_enqueued") {
     return { text: "FAILED", detail: error, isError: true, status: requestStatus };
@@ -1590,7 +1594,7 @@ function buildHomeResultsStatusInfo(requestId) {
 
   if (requestStatus === "failed" && error === "no_items_enqueued") {
     if (hasCandidates) {
-      const detail = `Best score ${bestText} · Threshold ${thresholdText}. Lower threshold or click Download next to a result.`;
+      const detail = `Best score ${bestText} · Threshold ${thresholdText}. Lower the threshold or use Advanced Search to enqueue a result.`;
       return { text: "Results found (below auto-download threshold)", detail, isError: false, status: requestStatus };
     }
     return {
@@ -1639,7 +1643,7 @@ function buildHomeResultsStatusInfo(requestId) {
 function updateHomeResultsStatusForRequest(requestId) {
   if (!requestId) {
     setHomeResultsStatus("Ready to discover media");
-    setHomeResultsDetail("Search Only is the default discovery action; downloads wait until you enqueue them.", false);
+    setHomeResultsDetail("Search Only is the default discovery action; use Search & Download to enqueue jobs.", false);
     return;
   }
   const info = buildHomeResultsStatusInfo(requestId);
@@ -1687,7 +1691,7 @@ const HOME_CANDIDATE_STATE_LABELS = {
   failed: "Failed",
   skipped: "Already queued",
 };
-function getHomeCandidateStateInfo(status) {
+function getHomeCandidateStateInfo(status, { searchOnly = false } = {}) {
   const key = status || "queued";
   const label = HOME_CANDIDATE_STATE_LABELS[key] || key;
   const className = {
@@ -1699,6 +1703,9 @@ function getHomeCandidateStateInfo(status) {
     failed: "failed",
     skipped: "skipped",
   }[key] || "queued";
+  if (searchOnly && key === "enqueued") {
+    return { label: "Matched", className: "matched" };
+  }
   return { label, className };
 }
 
@@ -1718,7 +1725,7 @@ function renderHomeResultItem(item) {
   card.appendChild(header);
   const detail = document.createElement("div");
   detail.className = "home-candidate-title";
-  detail.textContent = `Source: ${item.media_type || "music"} · ${item.position ? `Item ${item.position}` : ""}`.trim();
+  detail.textContent = `Source: ${item.media_type || "generic"} · ${item.position ? `Item ${item.position}` : ""}`.trim();
   card.appendChild(detail);
   const requestContext = state.homeRequestContext[item.request_id];
   const resolvedDestination = requestContext?.request?.resolved_destination;
@@ -1758,7 +1765,7 @@ function updateHomeResultItemCard(card, item) {
   }
   const detail = card.querySelector(".home-candidate-title");
   if (detail) {
-    detail.textContent = `Source: ${item.media_type || "music"} · ${item.position ? `Item ${item.position}` : ""}`.trim();
+    detail.textContent = `Source: ${item.media_type || "generic"} · ${item.position ? `Item ${item.position}` : ""}`.trim();
   }
   const resolvedDestination = state.homeRequestContext[item.request_id]?.request?.resolved_destination;
   let destinationEl = card.querySelector(".home-result-destination");
@@ -1883,26 +1890,31 @@ function renderHomeCandidateRow(candidate, item) {
 
   const action = document.createElement("div");
   action.className = "home-candidate-action";
-  const stateInfo = getHomeCandidateStateInfo(item.status);
+  const stateInfo = getHomeCandidateStateInfo(item.status, { searchOnly: state.homeSearchMode === "searchOnly" });
   const stateBadge = document.createElement("span");
   stateBadge.className = `home-candidate-state ${stateInfo.className}`;
   stateBadge.textContent = stateInfo.label;
   action.appendChild(stateBadge);
   if (state.homeSearchMode === "searchOnly") {
-    const itemQueued = ["enqueued", "selected", "skipped"].includes(item.status);
     const button = document.createElement("button");
     button.className = "button ghost small";
-    button.dataset.action = "home-download";
-    button.dataset.itemId = item.id || "";
-    button.dataset.candidateId = candidate.id || "";
-    button.textContent = itemQueued ? "Queued" : "Download";
-    button.disabled = itemQueued || !candidate.id || !candidate.url;
+    button.textContent = "Search only";
+    button.disabled = true;
     action.appendChild(button);
   } else {
     const label = document.createElement("span");
     label.textContent = "Auto";
     label.className = "meta";
     action.appendChild(label);
+  }
+  if (candidate.url) {
+    const openLink = document.createElement("a");
+    openLink.className = "button ghost small home-candidate-open";
+    openLink.textContent = "Open source";
+    openLink.href = candidate.url;
+    openLink.target = "_blank";
+    openLink.rel = "noopener noreferrer";
+    action.appendChild(openLink);
   }
   row.appendChild(action);
 
@@ -2002,11 +2014,28 @@ function guardHomeSearchNoCandidates(requestId, requestStatus, items) {
   state.homeNoCandidateStreaks[requestId] = 0;
 }
 
+function abortHomeResultPolling(message) {
+  stopHomeResultPolling();
+  setHomeResultsStatus("Search timed out");
+  setHomeResultsDetail(message || "Adapters took too long; try again or use Advanced Search.", true);
+  setHomeSearchControlsEnabled(true);
+}
+
 function startHomeResultPolling(requestId) {
   stopHomeResultPolling();
   showHomeResults(true);
+  state.homeSearchPollStart = Date.now();
   const tick = async () => {
     const status = await refreshHomeResults(requestId);
+    if (status === null) {
+      stopHomeResultPolling();
+      return;
+    }
+    const elapsed = state.homeSearchPollStart ? Date.now() - state.homeSearchPollStart : 0;
+    if (elapsed >= HOME_RESULT_TIMEOUT_MS) {
+      abortHomeResultPolling("No adapters responded in time. Please retry or use Advanced Search.");
+      return;
+    }
     if (status && ["completed", "completed_with_skips", "failed"].includes(status)) {
       stopHomeResultPolling();
     }
@@ -2061,8 +2090,9 @@ async function submitHomeSearch(autoEnqueue) {
 async function handleHomeDirectUrl(url, destination, messageEl) {
   if (!messageEl) return;
   const formatOverride = $("#home-format")?.value.trim();
-  const payload = {};
+  const treatAsMusic = $("#home-treat-music")?.checked ?? false;
   const playlistId = extractPlaylistIdFromUrl(url);
+  const payload = {};
   if (playlistId) {
     payload.playlist_id = playlistId;
   } else {
@@ -2074,6 +2104,7 @@ async function handleHomeDirectUrl(url, destination, messageEl) {
   if (formatOverride) {
     payload.final_format_override = formatOverride;
   }
+  payload.music_mode = treatAsMusic;
   setNotice(messageEl, "Direct URL download requested...", false);
   try {
     await startRun(payload);
@@ -2366,9 +2397,13 @@ async function refreshSearchCandidates(itemId) {
         ? formatDuration(candidate.duration_sec)
         : "";
       const score = Number.isFinite(candidate.final_score) ? candidate.final_score.toFixed(3) : "";
-      const downloadDisabled = !candidate.id || !candidate.url;
-      const actionHtml = `<button class="button ghost small" data-action="download" data-item-id="${itemId}" data-candidate-id="${candidate.id || ""}" ${downloadDisabled ? "disabled" : ""}>Download</button>`;
-      tr.innerHTML = `
+    const downloadDisabled = !candidate.id || !candidate.url;
+    const sourceUrl = candidate.url ? candidate.url.replace(/"/g, "&quot;") : "";
+    const openHtml = sourceUrl
+      ? `<a class="button ghost small" href="${sourceUrl}" target="_blank" rel="noopener noreferrer">Open source</a>`
+      : "";
+    const actionHtml = `<div class="action-group">${openHtml}<button class="button ghost small" data-action="download" data-item-id="${itemId}" data-candidate-id="${candidate.id || ""}" ${downloadDisabled ? "disabled" : ""}>Download</button></div>`;
+    tr.innerHTML = `
         <td>${candidate.source || ""}</td>
         <td>${canonicalHtml}</td>
         <td>${artworkHtml}</td>

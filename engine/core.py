@@ -20,6 +20,7 @@ from googleapiclient.errors import HttpError
 from yt_dlp import YoutubeDL
 
 from engine.job_queue import (
+    DownloadWorkerEngine,
     DownloadJobStore,
     build_output_template,
     ensure_download_jobs_table,
@@ -771,6 +772,7 @@ def run_single_download(
     *,
     paths: EnginePaths,
     status=None,
+    music_mode=None,
     **_ignored,
 ):
     if status is None:
@@ -784,9 +786,14 @@ def run_single_download(
     conn = init_db(paths.db_path)
     try:
         store = DownloadJobStore(paths.db_path)
-        origin = "search"
+        origin = "manual"
         origin_id = extract_video_id(video_url) or video_url
-        media_type = resolve_media_type(config, url=video_url)
+        effective_config = dict(config) if isinstance(config, dict) else {}
+        if music_mode is True:
+            effective_config["media_type"] = "music"
+        else:
+            effective_config["media_type"] = "video"
+        media_type = resolve_media_type(effective_config, url=video_url)
         media_intent = resolve_media_intent(origin, media_type)
         source = resolve_source(video_url)
 
@@ -813,6 +820,7 @@ def run_single_download(
             url=video_url,
             output_template=output_template,
             resolved_destination=resolved_destination,
+            log_duplicate_event=False,
         )
         if created:
             _status_append(status, "run_successes", job_id)
@@ -820,6 +828,38 @@ def run_single_download(
         return status.single_download_ok
     finally:
         conn.close()
+
+
+def run_direct_url_self_test(
+    config,
+    *,
+    paths: EnginePaths,
+    url="https://youtu.be/PmtGDk0c-JM",
+    final_format_override="webm",
+):
+    logging.info("RETREIVR_DIAG: enqueueing direct URL self-test for %s", url)
+    status = EngineStatus()
+    ok = run_single_download(
+        config,
+        url,
+        destination=None,
+        final_format_override=final_format_override,
+        paths=paths,
+        status=status,
+        music_mode=False,
+    )
+    if not ok or not status.run_successes:
+        logging.error("RETREIVR_DIAG: enqueue failed for %s", url)
+        return False
+    job_id = status.run_successes[-1]
+    store = DownloadJobStore(paths.db_path)
+    job = store.claim_job_by_id(job_id)
+    if not job:
+        logging.error("RETREIVR_DIAG: unable to claim job %s", job_id)
+        return False
+    worker = DownloadWorkerEngine(paths.db_path, config or {}, paths)
+    worker._execute_job(job)
+    return True
 
 
 def run_single_playlist(
@@ -1015,6 +1055,7 @@ def run_archive(
     final_format_override=None,
     stop_event=None,
     run_source="manual",
+    music_mode=None,
     **_ignored,
 ):
     if status is None:
@@ -1033,6 +1074,7 @@ def run_archive(
             paths=paths,
             status=status,
             stop_event=stop_event,
+            music_mode=music_mode,
         )
         status.single_download_ok = ok
         return status

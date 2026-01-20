@@ -375,6 +375,12 @@ body {
   color: var(--muted);
 }
 
+.home-candidate-open {
+  text-transform: none;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
 .home-candidate-state.searching {
   background: rgba(59, 130, 246, 0.15);
   color: #5f9bff;

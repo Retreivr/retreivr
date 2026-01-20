@@ -66,7 +66,8 @@ def resolve_search_db_path(queue_db_path, config=None):
     return os.path.join(base_dir, "search_jobs.sqlite")
 
 
-def _normalize_media_type(value, *, default="music"):
+def _normalize_media_type(value, *, default="generic"):
+    # Invariant A: media_type defaults to general/generic unless explicitly set.
     if value is None:
         return default
     value = str(value).strip().lower()
@@ -217,7 +218,7 @@ class SearchJobStore:
         intent = payload.get("intent")
         if intent not in {"track", "album", "artist", "artist_collection"}:
             raise ValueError("intent must be track, album, artist, or artist_collection")
-        media_type = _normalize_media_type(payload.get("media_type") or "music")
+        media_type = _normalize_media_type(payload.get("media_type") or "generic")
         if media_type not in {"music", "video", "generic"}:
             raise ValueError("media_type must be music, video, or generic")
         artist = payload.get("artist")
@@ -446,7 +447,7 @@ class SearchJobStore:
                 return
             item_type = "track" if request_row["intent"] == "track" else "album"
             item_id = uuid4().hex
-            media_type = _normalize_media_type(request_row.get("media_type")) or "music"
+            media_type = _normalize_media_type(request_row.get("media_type")) or "generic"
             cur.execute(
                 """
                 INSERT INTO search_items (
@@ -728,7 +729,7 @@ class SearchResolutionService:
             _log_event(logging.INFO, "item_candidate_found", request_id=request_id, item_id=item["id"])
 
             min_score = float(request_row.get("min_match_score") or 0.92)
-            request_media_type = request_row.get("media_type") or "music"
+            request_media_type = request_row.get("media_type") or "generic"
             is_music_request = request_media_type == "music"
             selection_threshold = min_score if is_music_request else 0.0
             chosen = select_best_candidate(ranked, selection_threshold)
@@ -754,6 +755,7 @@ class SearchResolutionService:
             )
 
             if not auto_enqueue:
+                # Invariant B: search-only requests never enqueue download jobs.
                 continue
 
             output_template = None
@@ -863,7 +865,19 @@ class SearchResolutionService:
             )
 
         items = self.store.list_items(request_id)
-        has_enqueued = any(item.get("status") in {"enqueued", "selected"} for item in items)
+        if not auto_enqueue:
+            has_candidates = any(
+                item.get("status") in {"candidate_found", "selected", "enqueued", "skipped"}
+                or item.get("error") == "no_candidate_above_threshold"
+                for item in items
+            )
+            if has_candidates:
+                self.store.update_request_status(request_id, "completed")
+            else:
+                self.store.update_request_status(request_id, "failed", error="no_candidates")
+            return request_id
+
+        has_enqueued = any(item.get("status") == "enqueued" for item in items)
         has_skipped = any(item.get("status") == "skipped" for item in items)
         if has_enqueued:
             status_value = "completed_with_skips" if has_skipped else "completed"
@@ -886,6 +900,9 @@ class SearchResolutionService:
         request = self.store.get_request_row(item.get("request_id"))
         if not request:
             return None
+        if request.get("auto_enqueue") in (0, False):
+            # Invariant B: search-only requests must never enqueue jobs.
+            raise ValueError("search_only_request_no_enqueue")
 
         destination_dir = request.get("destination_dir") or None
         output_template = None
@@ -918,7 +935,7 @@ class SearchResolutionService:
         job_id, created, dedupe_reason = self.queue_store.enqueue_job(
             origin="search",
             origin_id=request["id"],
-            media_type=item.get("media_type") or "music",
+            media_type=item.get("media_type") or "generic",
             media_intent=media_intent,
             source=candidate.get("source"),
             url=candidate.get("url"),
