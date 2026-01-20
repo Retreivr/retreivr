@@ -172,6 +172,23 @@ def ensure_download_jobs_table(conn):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_download_jobs_created ON download_jobs (created_at)")
     conn.commit()
 
+# --- ensure_downloads_table
+def ensure_downloads_table(conn):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS downloads (
+            video_id TEXT PRIMARY KEY,
+            playlist_id TEXT,
+            downloaded_at TEXT NOT NULL,
+            filepath TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_downloads_downloaded_at ON downloads (downloaded_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_downloads_playlist_id ON downloads (playlist_id)")
+    conn.commit()
+
 def is_music_media_type(value):
     if value is None:
         return False
@@ -675,6 +692,13 @@ class DownloadWorkerEngine:
         self.retry_delay_seconds = retry_delay_seconds
         self.store = DownloadJobStore(db_path)
         self.adapters = adapters or default_adapters()
+        # Ensure required DB tables exist (idempotent).
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        try:
+            ensure_download_jobs_table(conn)
+            ensure_downloads_table(conn)
+        finally:
+            conn.close()
         self._locks = {}
         self._locks_lock = threading.Lock()
 
@@ -1364,7 +1388,17 @@ def download_with_ytdlp(
 
     info = None
     try:
-        with YoutubeDL(opts) as ydl:
+        # yt-dlp may mutate the options dict internally; always pass a copy.
+        opts_for_run = dict(opts)
+        # HARD GUARD again on the copy.
+        if isinstance(opts_for_run.get("outtmpl"), dict):
+            default_tmpl = opts_for_run["outtmpl"].get("default")
+            opts_for_run["outtmpl"] = (
+                default_tmpl
+                if isinstance(default_tmpl, str) and default_tmpl.strip()
+                else "%(title).200s-%(id)s.%(ext)s"
+            )
+        with YoutubeDL(opts_for_run) as ydl:
             info = ydl.extract_info(url, download=True)
     except Exception as exc:
         # If a cookiefile is present and yt-dlp reports an empty download, retry once WITHOUT cookies.
@@ -1389,6 +1423,15 @@ def download_with_ytdlp(
                 noplaylist=opts.get("noplaylist"),
             )
             try:
+                retry_opts = dict(opts)
+                retry_opts.pop("cookiefile", None)
+                if isinstance(retry_opts.get("outtmpl"), dict):
+                    default_tmpl = retry_opts["outtmpl"].get("default")
+                    retry_opts["outtmpl"] = (
+                        default_tmpl
+                        if isinstance(default_tmpl, str) and default_tmpl.strip()
+                        else "%(title).200s-%(id)s.%(ext)s"
+                    )
                 with YoutubeDL(retry_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
             except Exception as retry_exc:
@@ -1820,6 +1863,7 @@ def record_download_history(db_path, job, filepath, *, meta=None):
     playlist_id = job.origin_id if job.origin == "playlist" else None
     conn = sqlite3.connect(db_path, check_same_thread=False)
     try:
+        ensure_downloads_table(conn)
         cur = conn.cursor()
         cur.execute(
             "INSERT OR REPLACE INTO downloads (video_id, playlist_id, downloaded_at, filepath) VALUES (?, ?, ?, ?)",
