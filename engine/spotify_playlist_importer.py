@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import requests
 
+from engine.json_utils import safe_json_dump
 from engine.paths import DATA_DIR, ensure_dir
 from engine.search_engine import _log_event
 
@@ -226,7 +227,7 @@ class SpotifyPlaylistImporter:
         }
         snapshot_path = os.path.join(self.snapshot_dir, f"{playlist_id}.json")
         with open(snapshot_path, "w", encoding="utf-8") as handle:
-            json.dump(snapshot, handle, indent=2)
+            safe_json_dump(snapshot, handle, indent=2)
 
     def _normalize_score(self, value):
         if value is None:

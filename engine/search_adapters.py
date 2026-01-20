@@ -1,8 +1,8 @@
-import json
 import logging
 
 from yt_dlp import YoutubeDL
 
+from engine.json_utils import safe_json_dumps
 
 class SearchAdapter:
     source = ""
@@ -70,7 +70,7 @@ class _YtDlpSearchMixin(SearchAdapter):
                 "track_detected": entry.get("track") or entry.get("title"),
                 "duration_sec": entry.get("duration"),
                 "artwork_url": entry.get("thumbnail"),
-                "raw_meta_json": json.dumps(entry, default=str),
+                "raw_meta_json": safe_json_dumps(entry),
                 "official": bool(entry.get("is_official")),
                 "isrc": isrc,
                 "track_count": track_count,

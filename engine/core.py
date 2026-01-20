@@ -1053,6 +1053,7 @@ def run_archive(
     single_url=None,
     destination=None,
     final_format_override=None,
+    delivery_mode=None,
     stop_event=None,
     run_source="manual",
     music_mode=None,
@@ -1066,6 +1067,15 @@ def run_archive(
     _status_set(status, "last_error_message", None)
 
     if single_url:
+        if delivery_mode == "search_only":
+            # Invariant B: Search-only requests must never enqueue or run direct downloads.
+            _status_set(
+                status,
+                "last_error_message",
+                "Search Only does not start direct URL downloads.",
+            )
+            status.single_download_ok = False
+            return status
         ok = run_single_download(
             config,
             single_url,

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -9,6 +10,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from engine.job_queue import DownloadJobStore, build_output_template, ensure_download_jobs_table
+from engine.json_utils import safe_json_dumps
 from engine.paths import DATA_DIR
 from engine.search_adapters import default_adapters
 from engine.search_scoring import rank_candidates, score_candidate, select_best_candidate
@@ -49,9 +51,28 @@ def _utc_now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+# Helper: Detect if a value is a URL
+def _is_url(value: str | None) -> bool:
+    if not value or not isinstance(value, str):
+        return False
+    return bool(re.match(r"^https?://", value.strip(), re.IGNORECASE))
+
+# Helper: Detect if any field in a payload contains a URL
+def _payload_contains_url(payload: dict) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    for v in payload.values():
+        if _is_url(v):
+            return True
+    return False
+
+
 def _log_event(level, message, **fields):
     payload = {"message": message, **fields}
-    logging.log(level, json.dumps(payload, sort_keys=True))
+    try:
+        logging.log(level, safe_json_dumps(payload, sort_keys=True))
+    except Exception as exc:
+        logging.log(level, f"log_event_serialization_failed: {exc} message={message}")
 
 
 def resolve_search_db_path(queue_db_path, config=None):
@@ -269,7 +290,7 @@ class SearchJobStore:
                     payload.get("quality_min_bitrate_kbps"),
                     1 if payload.get("lossless_only") else 0,
                     1 if auto_enqueue else 0,
-                    json.dumps(source_priority),
+                    safe_json_dumps(source_priority),
                     max_candidates,
                     "pending",
                     None,
@@ -334,6 +355,8 @@ class SearchJobStore:
             conn.close()
 
     def list_requests(self, *, status=None, limit=None):
+        # Always ensure schema before any SELECT to prevent missing-table errors
+        self.ensure_schema()
         conn = self._connect()
         try:
             cur = conn.cursor()
@@ -346,7 +369,13 @@ class SearchJobStore:
             if limit:
                 query += " LIMIT ?"
                 params.append(limit)
-            cur.execute(query, params)
+            try:
+                cur.execute(query, params)
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc):
+                    self.ensure_schema()
+                    return []
+                raise
             rows = []
             for row in cur.fetchall():
                 entry = dict(row)
@@ -625,6 +654,18 @@ class SearchResolutionService:
             conn.close()
 
     def create_search_request(self, payload):
+        # Invariant: URLs must never enter the search pipeline
+        if _payload_contains_url(payload):
+            logging.info(
+                safe_json_dumps(
+                    {
+                        "message": "SEARCH_BYPASS_URL",
+                        "reason": "direct_or_playlist_url",
+                        "payload": payload,
+                    }
+                )
+            )
+            return None
         return self.store.create_request(payload)
 
     def get_search_request(self, request_id):
@@ -646,6 +687,20 @@ class SearchResolutionService:
 
     def run_search_resolution_once(self, *, stop_event=None, request_id=None):
         request_row = self.store.claim_request(request_id)
+        # Absolute guardrail: never resolve URL-based requests
+        if request_row and _payload_contains_url(request_row):
+            self.store.update_request_status(
+                request_row["id"], "failed", error="url_must_bypass_search"
+            )
+            logging.info(
+                safe_json_dumps(
+                    {
+                        "message": "SEARCH_ABORT_URL_LEAK",
+                        "request_id": request_row["id"],
+                    }
+                )
+            )
+            return request_row["id"]
         if not request_row:
             return None
 
@@ -713,7 +768,7 @@ class SearchResolutionService:
                     modifier = adapter.source_modifier(cand)
                     scores = score_candidate(item, cand, source_modifier=modifier)
                     cand.update(scores)
-                    cand["canonical_json"] = json.dumps(canonical_payload) if canonical_payload else None
+                    cand["canonical_json"] = safe_json_dumps(canonical_payload) if canonical_payload else None
                     cand["id"] = uuid4().hex
                     scored.append(cand)
 
@@ -756,6 +811,13 @@ class SearchResolutionService:
 
             if not auto_enqueue:
                 # Invariant B: search-only requests never enqueue download jobs.
+                continue
+
+            # Do not enqueue downloads from search for playlists (must bypass search)
+            if chosen.get("url") and "list=" in chosen.get("url", ""):
+                self.store.update_item_status(
+                    item["id"], "skipped", error="playlist_url_bypass"
+                )
                 continue
 
             output_template = None

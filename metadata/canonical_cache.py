@@ -3,6 +3,7 @@ import os
 import threading
 import time
 
+from engine.json_utils import safe_json_dump
 
 class JsonCache:
     def __init__(self, path, *, ttl_seconds=86400):
@@ -36,7 +37,7 @@ class JsonCache:
         tmp_path = f"{self.path}.tmp"
         payload = {"version": 1, "entries": self._entries}
         with open(tmp_path, "w") as handle:
-            json.dump(payload, handle)
+            safe_json_dump(payload, handle)
         os.replace(tmp_path, self.path)
 
     def _is_valid(self, entry):

@@ -7,12 +7,13 @@ This will run the OAuth flow and save the token to tokens/token_main.json
 """
 import os
 import sys
-import argparse, json
+import argparse
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
+from engine.json_utils import safe_json_dump
 from engine.paths import TOKENS_DIR, ensure_dir, resolve_dir
 
 def _require_python_311():
@@ -78,7 +79,7 @@ def main():
 
     # Save token
     with open(token_file, "w") as f:
-        json.dump(creds_data, f, indent=2)
+        safe_json_dump(creds_data, f, indent=2)
     print(f"Saved token to {token_file}")
 
 if __name__ == "__main__":

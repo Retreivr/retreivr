@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import traceback
 import threading
 import time
 import urllib.parse
@@ -18,6 +19,7 @@ import requests
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, ExtractorError
 
+from engine.json_utils import json_sanity_check, safe_json_dumps
 from engine.paths import EnginePaths, TOKENS_DIR, resolve_dir
 from metadata.queue import enqueue_metadata
 
@@ -112,7 +114,10 @@ def utc_now():
 
 def _log_event(level, message, **fields):
     payload = {"message": message, **fields}
-    logging.log(level, json.dumps(payload, sort_keys=True))
+    try:
+        logging.log(level, safe_json_dumps(payload, sort_keys=True))
+    except Exception as exc:
+        logging.log(level, f"log_event_serialization_failed: {exc} message={message}")
 
 
 def ensure_download_jobs_table(conn):
@@ -245,6 +250,16 @@ class DownloadJobStore:
                 (JOB_STATUS_QUEUED, now),
             )
             return [row[0] for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def get_job_status(self, job_id):
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT status FROM download_jobs WHERE id=?", (job_id,))
+            row = cur.fetchone()
+            return row[0] if row else None
         finally:
             conn.close()
 
@@ -411,7 +426,7 @@ class DownloadJobStore:
         job_id = uuid4().hex
         now = utc_now()
         trace_id = trace_id or uuid4().hex
-        output_template_json = json.dumps(output_template) if output_template else None
+        output_template_json = safe_json_dumps(output_template) if output_template else None
 
         conn = self._connect()
         try:
@@ -514,18 +529,18 @@ class DownloadJobStore:
                     """
                     UPDATE download_jobs
                     SET status=?, completed=?, updated_at=?, file_path=?
-                    WHERE id=?
+                    WHERE id=? AND status!=?
                     """,
-                    (JOB_STATUS_COMPLETED, now, now, file_path, job_id),
+                    (JOB_STATUS_COMPLETED, now, now, file_path, job_id, JOB_STATUS_FAILED),
                 )
             else:
                 cur.execute(
                     """
                     UPDATE download_jobs
                     SET status=?, completed=?, updated_at=?
-                    WHERE id=?
+                    WHERE id=? AND status!=?
                     """,
-                    (JOB_STATUS_COMPLETED, now, now, job_id),
+                    (JOB_STATUS_COMPLETED, now, now, job_id, JOB_STATUS_FAILED),
                 )
             conn.commit()
         finally:
@@ -545,6 +560,34 @@ class DownloadJobStore:
                 (JOB_STATUS_FAILED, now, now, now, reason, job_id),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+    def cancel_active_jobs(self, *, reason=None):
+        now = utc_now()
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE download_jobs
+                SET status=?, canceled=?, failed=?, updated_at=?, last_error=?
+                WHERE status IN (?, ?, ?, ?)
+                """,
+                (
+                    JOB_STATUS_FAILED,
+                    now,
+                    now,
+                    now,
+                    reason,
+                    JOB_STATUS_QUEUED,
+                    JOB_STATUS_CLAIMED,
+                    JOB_STATUS_DOWNLOADING,
+                    JOB_STATUS_POSTPROCESSING,
+                ),
+            )
+            conn.commit()
+            return cur.rowcount
         finally:
             conn.close()
 
@@ -607,9 +650,9 @@ class DownloadJobStore:
                 """
                 UPDATE download_jobs
                 SET status=?, postprocessing=?, updated_at=?
-                WHERE id=?
+                WHERE id=? AND status!=?
                 """,
-                (JOB_STATUS_POSTPROCESSING, now, now, job_id),
+                (JOB_STATUS_POSTPROCESSING, now, now, job_id, JOB_STATUS_FAILED),
             )
             conn.commit()
         finally:
@@ -655,6 +698,7 @@ class DownloadWorkerEngine:
             thread.join()
 
     def run_loop(self, *, poll_seconds=5, stop_event=None):
+        json_sanity_check()
         _log_event(logging.INFO, "worker_started")
         _log_event(logging.INFO, "queue_polling_started")
         while True:
@@ -703,6 +747,27 @@ class DownloadWorkerEngine:
                 media_intent=job.media_intent,
             )
             return
+        if stop_event and stop_event.is_set():
+            error_message = "cancel_requested"
+            self.store.record_failure(
+                job,
+                error_message=error_message,
+                retryable=False,
+                retry_delay_seconds=self.retry_delay_seconds,
+            )
+            _log_event(
+                logging.ERROR,
+                "job_failed",
+                job_id=job.id,
+                trace_id=job.trace_id,
+                source=job.source,
+                origin=job.origin,
+                media_intent=job.media_intent,
+                retryable=False,
+                status=JOB_STATUS_FAILED,
+                error=error_message,
+            )
+            return
         adapter = self.adapters.get(job.source)
         if not adapter:
             _log_event(
@@ -741,6 +806,29 @@ class DownloadWorkerEngine:
             if not result:
                 raise RuntimeError("adapter_execute_failed")
             final_path, meta = result
+            if self.store.get_job_status(job.id) == JOB_STATUS_FAILED:
+                return
+            if stop_event and stop_event.is_set():
+                error_message = "cancel_requested"
+                self.store.record_failure(
+                    job,
+                    error_message=error_message,
+                    retryable=False,
+                    retry_delay_seconds=self.retry_delay_seconds,
+                )
+                _log_event(
+                    logging.ERROR,
+                    "job_failed",
+                    job_id=job.id,
+                    trace_id=job.trace_id,
+                    source=job.source,
+                    origin=job.origin,
+                    media_intent=job.media_intent,
+                    retryable=False,
+                    status=JOB_STATUS_FAILED,
+                    error=error_message,
+                )
+                return
             self.store.mark_postprocessing(job.id)
             record_download_history(
                 self.db_path,
@@ -760,6 +848,19 @@ class DownloadWorkerEngine:
                 path=final_path,
             )
         except Exception as exc:
+            if (
+                isinstance(exc, TypeError)
+                and "set" in str(exc)
+                and "JSON" in str(exc)
+            ):
+                _log_event(
+                    logging.ERROR,
+                    "json_set_serialization_trace",
+                    job_id=job.id,
+                    url=job.url,
+                    error=str(exc),
+                    traceback=traceback.format_exc(),
+                )
             error_message = f"{type(exc).__name__}: {exc}"
             retryable = is_retryable_error(exc)
             new_status = self.store.record_failure(
@@ -789,13 +890,18 @@ class YouTubeAdapter:
         raw_final_format = output_template.get("final_format")
         normalized_format = _normalize_format(raw_final_format)
         normalized_audio_format = _normalize_audio_format(raw_final_format)
-        audio_format = normalized_audio_format if normalized_audio_format in _AUDIO_FORMATS else None
-        audio_mode = is_music_media_type(job.media_type) and (
-            not raw_final_format or audio_format
-        )
-        final_format = audio_format if audio_mode else normalized_format
-        if audio_mode and not final_format:
-            final_format = "mp3"
+
+        # Strict separation:
+        # - music_mode controls whether we run music metadata enrichment.
+        # - audio_only controls whether we download audio-only / extract audio via ffmpeg.
+        # IMPORTANT: Do NOT let a global/default final_format="mp3" force *video* jobs into audio-only.
+        music_mode = is_music_media_type(job.media_type)
+        audio_only_requested = bool(output_template.get("audio_only")) or bool(output_template.get("audio_mode"))
+        audio_mode = bool(audio_only_requested) or (music_mode and normalized_audio_format in _AUDIO_FORMATS)
+
+        # If we're in audio_mode, final_format is the requested audio codec (mp3/m4a/flac).
+        # Otherwise final_format is treated as a container preference (webm/mp4/mkv) or None.
+        final_format = normalized_audio_format if audio_mode else normalized_format
         filename_template = output_template.get("filename_template")
         audio_template = output_template.get("audio_filename_template")
 
@@ -857,8 +963,13 @@ class YouTubeAdapter:
                     pass
                 raise RuntimeError("empty_output_file")
 
-            if audio_mode:
-                enqueue_media_metadata(final_path, meta, config)
+            # Only enqueue metadata if music_mode is True
+            if music_mode:
+                try:
+                    enqueue_media_metadata(final_path, meta, config)
+                except Exception:
+                    # Never raise or affect download success
+                    pass
 
             return final_path, meta
         except Exception:
@@ -873,6 +984,8 @@ def default_adapters():
         "youtube_music": adapter,
         "soundcloud": adapter,
         "bandcamp": adapter,
+        "direct": adapter,
+        "unknown": adapter,
     }
 
 
@@ -937,7 +1050,13 @@ def build_output_template(config, *, playlist_entry=None, destination=None, base
     entry = playlist_entry if isinstance(playlist_entry, dict) else {}
     output_dir = destination or entry.get("folder") or entry.get("directory")
     if not output_dir:
-        output_dir = config.get("music_download_folder") or config.get("single_download_folder") or base_dir
+        # Prefer the correct default folder based on media type intent.
+        # If the run is not explicitly music/audio, do NOT default into the music folder.
+        media_type = str(entry.get("media_type") or entry.get("media") or "").strip().lower()
+        if media_type in {"music", "audio"}:
+            output_dir = config.get("music_download_folder") or config.get("single_download_folder") or base_dir
+        else:
+            output_dir = config.get("single_download_folder") or config.get("music_download_folder") or base_dir
     output_dir = resolve_dir(output_dir, base_dir)
 
     final_format = entry.get("final_format") or config.get("final_format")
@@ -981,19 +1100,68 @@ def build_ytdlp_opts(context):
     target_format = context.get("final_format")
     output_template = context.get("output_template")
     overrides = context.get("overrides") or {}
+    allow_chapter_outtmpl = bool(context.get("allow_chapter_outtmpl"))
+
+    def _url_looks_like_playlist(u: str | None) -> bool:
+        if not u:
+            return False
+        try:
+            parsed = urllib.parse.urlparse(u)
+            q = urllib.parse.parse_qs(parsed.query)
+            # YouTube playlist patterns
+            if "list" in q and q.get("list"):
+                return True
+            # Common non-YouTube playlist patterns (best-effort)
+            if any(k in q for k in ("playlist", "pl", "set")):
+                return True
+            # Path-based playlist URLs
+            if "/playlist" in (parsed.path or ""):
+                return True
+        except Exception:
+            return False
+        return False
+
+    # Playlists: let yt-dlp expand playlists itself when the run/job indicates playlist intent.
+    # This must override the previous "single item" behavior; forcing noplaylist=True breaks scheduler/watcher.
+    allow_playlist = bool(context.get("allow_playlist"))
+    if not allow_playlist:
+        if context.get("media_intent") == "playlist":
+            allow_playlist = True
+        elif context.get("origin") == "playlist":
+            allow_playlist = True
+        elif operation in {"playlist", "playlist_probe", "playlist_metadata"}:
+            allow_playlist = True
+        elif _url_looks_like_playlist(context.get("url")):
+            allow_playlist = True
+
+    if isinstance(output_template, dict) and not allow_chapter_outtmpl:
+        default_template = output_template.get("default")
+        if isinstance(default_template, str) and default_template.strip():
+            output_template = default_template
+        else:
+            output_template = "%(title).200s-%(id)s.%(ext)s"
 
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": operation != "playlist",
+        # CLI parity: allow playlist expansion when requested; otherwise behave like a single-URL download.
+        "noplaylist": False if allow_playlist else True,
         "outtmpl": output_template,
+        # Avoid chapter workflows unless explicitly enabled.
+        # (Chapter outtmpl dicts can trigger unexpected behavior in the Python API path.)
+        "no_chapters": True if not allow_chapter_outtmpl else False,
         "retries": 3,
         "fragment_retries": 3,
         "overwrites": True,
     }
 
     cookie_file = context.get("cookie_file")
-    if cookie_file:
+    # Cookies OFF by default. Only enable when explicitly allowed or when running in music mode.
+    # This prevents YouTube/SABR edge cases that produced empty/403 fragment downloads in the worker path.
+    allow_cookies = bool(context.get("allow_cookies")) or (
+        bool(context.get("audio_mode")) and is_music_media_type(context.get("media_type"))
+    )
+    if cookie_file and allow_cookies:
         opts["cookiefile"] = cookie_file
 
     if operation == "playlist":
@@ -1002,7 +1170,9 @@ def build_ytdlp_opts(context):
     elif operation == "metadata":
         opts["skip_download"] = True
     else:
-        if audio_mode:
+        # Only enable addmetadata, embedthumbnail, writethumbnail, and audio postprocessors
+        # when both audio_mode and media_type is music/audio
+        if audio_mode and is_music_media_type(context.get("media_type")):
             normalized_audio = _normalize_audio_format(target_format)
             if normalized_audio and normalized_audio in _AUDIO_FORMATS:
                 opts["postprocessors"] = _build_audio_postprocessors(normalized_audio)
@@ -1012,6 +1182,8 @@ def build_ytdlp_opts(context):
             opts["addmetadata"] = True
             opts["embedthumbnail"] = True
             opts["writethumbnail"] = True
+        elif audio_mode:
+            opts["format"] = _FORMAT_AUDIO
         else:
             normalized = _normalize_format(target_format)
             if normalized in {"webm", "mp4", "mkv"}:
@@ -1042,6 +1214,7 @@ def build_ytdlp_opts(context):
         embedthumbnail=opts.get("embedthumbnail"),
         writethumbnail=opts.get("writethumbnail"),
         overrides=context.get("overrides"),
+        allow_playlist=allow_playlist,
     )
 
     return opts
@@ -1121,9 +1294,12 @@ def download_with_ytdlp(
 ):
     if stop_event and stop_event.is_set():
         return None, None
-    output_template = os.path.join(temp_dir, "%(title).200s-%(id)s.%(ext)s")
+    # Use an ID-based template in temp_dir (CLI parity and avoids title/path edge cases).
+    # The final user-facing name is applied later when we move/rename the completed file.
+    output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
     context = {
         "operation": "download",
+        "url": url,
         "audio_mode": audio_mode,
         "final_format": final_format,
         "output_template": output_template,
@@ -1131,6 +1307,7 @@ def download_with_ytdlp(
         "overrides": (config or {}).get("yt_dlp_opts") or {},
         "media_type": media_type,
         "media_intent": media_intent,
+        "origin": origin,
     }
     opts = build_ytdlp_opts(context)
 
@@ -1154,72 +1331,144 @@ def download_with_ytdlp(
         opts=_redact_ytdlp_opts(opts),
     )
 
+    # HARD GUARD: yt-dlp download path must use string outtmpl (CLI parity)
+    outtmpl = opts.get("outtmpl")
+    if isinstance(outtmpl, dict):
+        logging.error(
+            "COERCING_DICT_OUTTMPL download_with_ytdlp job_id=%s outtmpl=%r",
+            job_id,
+            outtmpl,
+        )
+        default_tmpl = outtmpl.get("default") if isinstance(outtmpl, dict) else None
+        opts["outtmpl"] = (
+            default_tmpl
+            if isinstance(default_tmpl, str) and default_tmpl.strip()
+            else "%(title).200s-%(id)s.%(ext)s"
+        )
+
+    logging.info(
+        "PRE_YTDLP_EXEC job_id=%s outtmpl_type=%s outtmpl=%r",
+        job_id,
+        type(opts.get("outtmpl")).__name__,
+        opts.get("outtmpl"),
+    )
+
+    def _is_empty_download_error(e: Exception) -> bool:
+        msg = str(e) or ""
+        msg_l = msg.lower()
+        return (
+            "downloaded file is empty" in msg_l
+            or "http error 403" in msg_l
+            or "forbidden" in msg_l
+        )
+
     info = None
     try:
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
     except Exception as exc:
-        _log_event(
-            logging.ERROR,
-            "YTDLP_FAILED",
-            job_id=job_id,
-            url=url,
-            origin=origin,
-            media_type=media_type,
-            media_intent=media_intent,
-            audio_mode=audio_mode,
-            final_format=final_format,
-            format=opts.get("format"),
-            merge_output_format=opts.get("merge_output_format"),
-            outtmpl=opts.get("outtmpl"),
-            noplaylist=opts.get("noplaylist"),
-            error=str(exc),
-            opts=_redact_ytdlp_opts(opts),
-        )
-        _log_event(
-            logging.ERROR,
-            "ytdlp_download_failed",
-            job_id=job_id,
-            url=url,
-            origin=origin,
-            media_type=media_type,
-            media_intent=media_intent,
-            audio_mode=audio_mode,
-            final_format=final_format,
-            format=opts.get("format"),
-            merge_output_format=opts.get("merge_output_format"),
-            outtmpl=opts.get("outtmpl"),
-            noplaylist=opts.get("noplaylist"),
-            error=str(exc),
-        )
-        if "Requested format is not available" in str(exc):
+        # If a cookiefile is present and yt-dlp reports an empty download, retry once WITHOUT cookies.
+        # This matches the observed CLI behavior (no cookies) and avoids poisoning downloads with bad/expired cookies.
+        if _is_empty_download_error(exc) and opts.get("cookiefile"):
+            retry_opts = dict(opts)
+            retry_opts.pop("cookiefile", None)
+            # Keep worker logs quiet, but allow yt-dlp to behave normally.
+            _log_event(
+                logging.WARNING,
+                "YTDLP_EMPTY_FILE_RETRY_NO_COOKIES",
+                job_id=job_id,
+                url=url,
+                origin=origin,
+                media_type=media_type,
+                media_intent=media_intent,
+                audio_mode=audio_mode,
+                final_format=final_format,
+                format=opts.get("format"),
+                merge_output_format=opts.get("merge_output_format"),
+                outtmpl=opts.get("outtmpl"),
+                noplaylist=opts.get("noplaylist"),
+            )
             try:
-                list_opts = dict(opts)
-                list_opts["skip_download"] = True
-                with YoutubeDL(list_opts) as ydl:
-                    info_probe = ydl.extract_info(url, download=False)
-                summary = _format_summary(info_probe)
+                with YoutubeDL(retry_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+            except Exception as retry_exc:
                 _log_event(
                     logging.ERROR,
-                    "ytdlp_format_summary",
+                    "YTDLP_EMPTY_FILE_RETRY_FAILED",
                     job_id=job_id,
                     url=url,
-                    format=opts.get("format"),
-                    merge_output_format=opts.get("merge_output_format"),
-                    format_count=summary["format_count"],
-                    exts=summary["exts"],
-                    has_webm=summary["has_webm"],
+                    origin=origin,
+                    media_type=media_type,
+                    media_intent=media_intent,
+                    audio_mode=audio_mode,
+                    final_format=final_format,
+                    error=str(retry_exc),
+                    opts=_redact_ytdlp_opts(retry_opts),
                 )
-            except Exception as probe_exc:
-                _log_event(
-                    logging.ERROR,
-                    "ytdlp_format_summary_failed",
-                    job_id=job_id,
-                    url=url,
-                    format=opts.get("format"),
-                    error=str(probe_exc),
-                )
-        raise RuntimeError(f"yt_dlp_download_failed: {exc}")
+                # Fall through to normal failure handling using the original exception.
+
+        if info is None:
+            _log_event(
+                logging.ERROR,
+                "YTDLP_FAILED",
+                job_id=job_id,
+                url=url,
+                origin=origin,
+                media_type=media_type,
+                media_intent=media_intent,
+                audio_mode=audio_mode,
+                final_format=final_format,
+                format=opts.get("format"),
+                merge_output_format=opts.get("merge_output_format"),
+                outtmpl=opts.get("outtmpl"),
+                noplaylist=opts.get("noplaylist"),
+                error=str(exc),
+                opts=_redact_ytdlp_opts(opts),
+            )
+            _log_event(
+                logging.ERROR,
+                "ytdlp_download_failed",
+                job_id=job_id,
+                url=url,
+                origin=origin,
+                media_type=media_type,
+                media_intent=media_intent,
+                audio_mode=audio_mode,
+                final_format=final_format,
+                format=opts.get("format"),
+                merge_output_format=opts.get("merge_output_format"),
+                outtmpl=opts.get("outtmpl"),
+                noplaylist=opts.get("noplaylist"),
+                error=str(exc),
+            )
+            if "Requested format is not available" in str(exc):
+                try:
+                    list_opts = dict(opts)
+                    list_opts["skip_download"] = True
+                    with YoutubeDL(list_opts) as ydl:
+                        info_probe = ydl.extract_info(url, download=False)
+                    summary = _format_summary(info_probe)
+                    _log_event(
+                        logging.ERROR,
+                        "ytdlp_format_summary",
+                        job_id=job_id,
+                        url=url,
+                        format=opts.get("format"),
+                        merge_output_format=opts.get("merge_output_format"),
+                        format_count=summary["format_count"],
+                        exts=summary["exts"],
+                        has_webm=summary["has_webm"],
+                    )
+                except Exception as probe_exc:
+                    _log_event(
+                        logging.ERROR,
+                        "ytdlp_format_summary_failed",
+                        job_id=job_id,
+                        url=url,
+                        format=opts.get("format"),
+                        error=str(probe_exc),
+                    )
+            raise RuntimeError(f"yt_dlp_download_failed: {exc}")
 
     if stop_event and stop_event.is_set():
         return None, None
@@ -1235,19 +1484,64 @@ def download_with_ytdlp(
     if local_path and os.path.exists(local_path):
         return info, local_path
 
+    candidates = []
     for entry in os.listdir(temp_dir):
-        if entry.endswith(".part"):
+        # Ignore yt-dlp temporary/partial artifacts
+        if entry.endswith((".part", ".ytdl", ".temp")):
             continue
         candidate = os.path.join(temp_dir, entry)
         if os.path.isfile(candidate):
-            return info, candidate
+            try:
+                size = os.path.getsize(candidate)
+            except OSError:
+                size = 0
+            if size > 0:
+                candidates.append((size, candidate))
+
+    if candidates:
+        candidates.sort(reverse=True)
+        return info, candidates[0][1]
 
     raise RuntimeError("yt_dlp_no_output")
+
+
+def preview_direct_url(url, config):
+    cookie_file = resolve_cookie_file(config or {})
+    context = {
+        "operation": "metadata",
+        "url": url,
+        "audio_mode": False,
+        "final_format": None,
+        "output_template": None,
+        "cookie_file": cookie_file,
+        "overrides": (config or {}).get("yt_dlp_opts") or {},
+        "media_type": "video",
+        "media_intent": "episode",
+    }
+    opts = build_ytdlp_opts(context)
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    meta = extract_meta(info, fallback_url=url)
+    return {
+        "title": meta.get("title"),
+        "uploader": meta.get("channel") or meta.get("artist"),
+        "thumbnail_url": meta.get("thumbnail_url"),
+        "url": meta.get("url") or url,
+        "source": resolve_source(url),
+        "duration_sec": info.get("duration") if isinstance(info, dict) else None,
+    }
 
 
 def extract_meta(info, *, fallback_url=None):
     if not isinstance(info, dict):
         return {}
+    tags = info.get("tags") or []
+    if isinstance(tags, set):
+        tags = sorted(tags)
+    elif isinstance(tags, tuple):
+        tags = list(tags)
+    elif not isinstance(tags, list):
+        tags = [str(tags)]
     return {
         "video_id": info.get("id"),
         "title": info.get("title"),
@@ -1261,7 +1555,7 @@ def extract_meta(info, *, fallback_url=None):
         "release_date": info.get("release_date"),
         "upload_date": info.get("upload_date"),
         "description": info.get("description") or "",
-        "tags": info.get("tags") or [],
+        "tags": tags,
         "url": info.get("webpage_url") or fallback_url,
         "thumbnail_url": info.get("thumbnail"),
     }
@@ -1551,10 +1845,14 @@ def extract_video_id(url):
 
 
 def is_retryable_error(error):
+    if isinstance(error, TypeError):
+        return False
     if isinstance(error, (DownloadError, ExtractorError)):
         message = str(error).lower()
     else:
         message = str(error).lower()
+    if "json serializable" in message or "not json" in message:
+        return False
     if "drm" in message:
         return False
     if "http error 403" in message or "http error 404" in message:

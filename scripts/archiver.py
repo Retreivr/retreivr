@@ -29,13 +29,13 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 import argparse
-import json
 import logging
 import signal
 import threading
 
 from engine.core import EngineStatus, load_config, run_archive
 from engine.paths import CONFIG_DIR, DATA_DIR, DOWNLOADS_DIR, LOG_DIR, TOKENS_DIR, build_engine_paths, ensure_dir, resolve_config_path
+from engine.json_utils import safe_json_dumps
 from engine.runtime import get_runtime_info
 
 def _setup_logging(log_dir):
@@ -62,7 +62,7 @@ def main():
     args = parser.parse_args()
 
     if args.version:
-        print(json.dumps(get_runtime_info(), indent=2))
+        print(safe_json_dumps(get_runtime_info(), indent=2))
         return
 
     paths = build_engine_paths()

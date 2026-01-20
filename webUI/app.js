@@ -34,6 +34,9 @@ const state = {
   spotifyPlaylistStatus: {},
   homeNoCandidateStreaks: {},
   homeDestinationInvalid: false,
+  homeDirectPreview: null,
+  homeDirectJob: null,
+  homeDirectJobTimer: null,
 };
 const browserState = {
   open: false,
@@ -79,6 +82,10 @@ const HOME_STATUS_LABELS = {
   candidate_found: "Matched",
   selected: "Matched",
   enqueued: "Queued",
+  claimed: "Downloading",
+  downloading: "Downloading",
+  postprocessing: "Downloading",
+  completed: "Completed",
   failed: "Failed",
   skipped: "Failed",
 };
@@ -88,6 +95,10 @@ const HOME_STATUS_CLASS_MAP = {
   candidate_found: "matched",
   selected: "matched",
   enqueued: "queued",
+  claimed: "queued",
+  downloading: "queued",
+  postprocessing: "queued",
+  completed: "matched",
   failed: "failed",
   skipped: "failed",
 };
@@ -1895,7 +1906,18 @@ function renderHomeCandidateRow(candidate, item) {
   stateBadge.className = `home-candidate-state ${stateInfo.className}`;
   stateBadge.textContent = stateInfo.label;
   action.appendChild(stateBadge);
-  if (state.homeSearchMode === "searchOnly") {
+  const allowDownload = Boolean(candidate.allow_download || item.allow_download);
+  if (state.homeSearchMode === "searchOnly" && allowDownload) {
+    const jobStatus = candidate.job_status || "";
+    const queued = ["queued", "claimed", "downloading", "postprocessing", "completed"].includes(jobStatus);
+    const button = document.createElement("button");
+    button.className = "button ghost small";
+    button.dataset.action = "home-direct-download";
+    button.dataset.directUrl = candidate.url || "";
+    button.textContent = queued ? "Queued" : "Download";
+    button.disabled = queued || !candidate.url;
+    action.appendChild(button);
+  } else if (state.homeSearchMode === "searchOnly") {
     const button = document.createElement("button");
     button.className = "button ghost small";
     button.textContent = "Search only";
@@ -1919,6 +1941,133 @@ function renderHomeCandidateRow(candidate, item) {
   row.appendChild(action);
 
   return row;
+}
+
+function renderHomeDirectUrlCard(preview, status) {
+  const card = document.createElement("article");
+  card.className = "home-result-card";
+  card.dataset.directUrl = preview.url || "";
+  const header = document.createElement("div");
+  header.className = "home-result-header";
+  const title = document.createElement("div");
+  const summary = preview.title || preview.url || "Direct URL";
+  title.innerHTML = `<strong>${summary}</strong>`;
+  header.appendChild(title);
+  header.appendChild(renderHomeStatusBadge(status));
+  card.appendChild(header);
+  const detail = document.createElement("div");
+  detail.className = "home-candidate-title";
+  detail.textContent = `Source: ${preview.source || "direct"}${preview.uploader ? ` · ${preview.uploader}` : ""}`;
+  card.appendChild(detail);
+  const candidateList = document.createElement("div");
+  candidateList.className = "home-candidate-list";
+  const candidate = {
+    id: "direct-url-candidate",
+    title: preview.title,
+    artist_detected: preview.uploader,
+    album_detected: null,
+    track_detected: null,
+    final_score: null,
+    source: preview.source || "direct",
+    url: preview.url,
+    thumbnail_url: preview.thumbnail_url,
+    allow_download: true,
+    job_status: preview.job_status || "",
+  };
+  const item = {
+    id: "direct-url-item",
+    status,
+    allow_download: true,
+  };
+  candidateList.appendChild(renderHomeCandidateRow(candidate, item));
+  card.appendChild(candidateList);
+  return card;
+}
+
+function showHomeDirectUrlPreview(preview) {
+  const container = $("#home-results-list");
+  if (!container) return;
+  state.homeSearchMode = "searchOnly";
+  stopHomeDirectJobPolling();
+  state.homeDirectPreview = preview;
+  state.homeSearchRequestId = null;
+  state.homeRequestContext = {};
+  state.homeBestScores = {};
+  state.homeCandidateCache = {};
+  state.homeCandidatesLoading = {};
+  showHomeResults(true);
+  setHomeResultsStatus("Direct URL preview");
+  setHomeResultsDetail("Review the metadata and click Download to enqueue.", false);
+  stopHomeResultPolling();
+  container.textContent = "";
+  const card = renderHomeDirectUrlCard(preview, "candidate_found");
+  container.appendChild(card);
+}
+
+function stopHomeDirectJobPolling() {
+  if (state.homeDirectJobTimer) {
+    clearInterval(state.homeDirectJobTimer);
+    state.homeDirectJobTimer = null;
+  }
+}
+
+async function refreshHomeDirectJobStatus() {
+  if (!state.homeDirectJob) {
+    return;
+  }
+  const container = $("#home-results-list");
+  if (!container) return;
+  try {
+    const data = await fetchJson("/api/download_jobs?limit=50");
+    const jobs = data.jobs || [];
+    const job = jobs.find((entry) => {
+      if (state.homeDirectJob.playlistId) {
+        return entry.origin === "playlist" && entry.origin_id === state.homeDirectJob.playlistId;
+      }
+      return entry.url === state.homeDirectJob.url;
+    });
+    if (job) {
+      state.homeDirectJob.status = job.status;
+      state.homeDirectPreview = {
+        ...state.homeDirectPreview,
+        job_status: job.status,
+      };
+      container.textContent = "";
+      const card = renderHomeDirectUrlCard(state.homeDirectPreview, job.status);
+      container.appendChild(card);
+      setHomeResultsStatus(formatDirectJobStatus(job.status));
+      setHomeResultsDetail(job.last_error || "", Boolean(job.last_error));
+      if (["completed", "failed"].includes(job.status)) {
+        stopHomeDirectJobPolling();
+        setHomeSearchControlsEnabled(true);
+      }
+    }
+  } catch (err) {
+    setHomeResultsStatus("Direct URL status error");
+    setHomeResultsDetail(`Failed to load job status: ${err.message}`, true);
+    stopHomeDirectJobPolling();
+    setHomeSearchControlsEnabled(true);
+  }
+}
+
+function startHomeDirectJobPolling() {
+  stopHomeDirectJobPolling();
+  const tick = async () => {
+    await refreshHomeDirectJobStatus();
+  };
+  state.homeDirectJobTimer = setInterval(tick, 4000);
+  tick();
+}
+
+function formatDirectJobStatus(status) {
+  if (!status) return "Queued";
+  if (status === "claimed" || status === "downloading" || status === "postprocessing") {
+    return "Downloading";
+  }
+  if (status === "queued") return "Queued";
+  if (status === "completed") return "Completed";
+  if (status === "failed") return "Failed";
+  return status[0]?.toUpperCase() + status.slice(1);
 }
 
 async function refreshHomeResults(requestId) {
@@ -2052,6 +2201,9 @@ async function submitHomeSearch(autoEnqueue) {
     return;
   }
   setHomeSearchControlsEnabled(false);
+  stopHomeDirectJobPolling();
+  state.homeDirectJob = null;
+  state.homeDirectPreview = null;
   if (hasInvalidDestinationValue(destinationValue)) {
     setNotice(messageEl, "Destination path is invalid; please select a folder within downloads.", true);
     setHomeSearchControlsEnabled(true);
@@ -2059,6 +2211,10 @@ async function submitHomeSearch(autoEnqueue) {
   }
   try {
     if (isValidHttpUrl(inputValue)) {
+      if (!autoEnqueue) {
+        await handleHomeDirectUrlPreview(inputValue, destinationValue, messageEl);
+        return;
+      }
       await handleHomeDirectUrl(inputValue, destinationValue, messageEl);
       return;
     }
@@ -2108,9 +2264,53 @@ async function handleHomeDirectUrl(url, destination, messageEl) {
   setNotice(messageEl, "Direct URL download requested...", false);
   try {
     await startRun(payload);
+    state.homeSearchMode = "download";
+    state.homeDirectJob = {
+      url,
+      playlistId: playlistId || null,
+      startedAt: new Date().toISOString(),
+      status: "queued",
+    };
+    state.homeDirectPreview = {
+      title: url,
+      url,
+      source: playlistId ? "playlist" : "direct",
+      uploader: null,
+      thumbnail_url: null,
+      job_status: "queued",
+    };
+    showHomeResults(true);
+    setHomeResultsStatus("Queued");
+    setHomeResultsDetail("Direct URL download queued.", false);
+    const container = $("#home-results-list");
+    if (container) {
+      container.textContent = "";
+      container.appendChild(renderHomeDirectUrlCard(state.homeDirectPreview, "enqueued"));
+    }
+    startHomeDirectJobPolling();
     setNotice(messageEl, "Direct URL download started", false);
   } catch (err) {
     setNotice(messageEl, `Direct download failed: ${err.message}`, true);
+  } finally {
+    setHomeSearchControlsEnabled(true);
+  }
+}
+
+async function handleHomeDirectUrlPreview(url, destination, messageEl) {
+  if (!messageEl) return;
+  setNotice(messageEl, "Fetching URL metadata...", false);
+  try {
+    const data = await fetchJson("/api/direct_url_preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    const preview = data.preview || {};
+    preview.url = preview.url || url;
+    showHomeDirectUrlPreview(preview);
+    setNotice(messageEl, "Direct URL preview ready", false);
+  } catch (err) {
+    setNotice(messageEl, `Preview failed: ${err.message}`, true);
   } finally {
     setHomeSearchControlsEnabled(true);
   }
@@ -3361,6 +3561,15 @@ if (homeAdvancedToggle && homeAdvancedPanel) {
   const homeResultsList = $("#home-results-list");
   if (homeResultsList) {
     homeResultsList.addEventListener("click", async (event) => {
+      const directButton = event.target.closest('button[data-action="home-direct-download"]');
+      if (directButton) {
+        if (directButton.disabled) return;
+        const directUrl = directButton.dataset.directUrl;
+        if (!directUrl) return;
+        directButton.disabled = true;
+        await handleHomeDirectUrl(directUrl, $("#home-destination")?.value.trim() || "", $("#home-search-message"));
+        return;
+      }
       const button = event.target.closest('button[data-action="home-download"]');
       if (!button) return;
       const itemId = button.dataset.itemId;

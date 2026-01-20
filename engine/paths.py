@@ -14,11 +14,11 @@ def _env_path(name, default):
 
 
 # Base directories for all file access. Override via env for container mounts.
-CONFIG_DIR = _env_path("YT_ARCHIVER_CONFIG_DIR", PROJECT_ROOT / "config")
-DATA_DIR = _env_path("YT_ARCHIVER_DATA_DIR", PROJECT_ROOT)
-DOWNLOADS_DIR = _env_path("YT_ARCHIVER_DOWNLOADS_DIR", PROJECT_ROOT / "downloads")
-LOG_DIR = _env_path("YT_ARCHIVER_LOG_DIR", PROJECT_ROOT / "logs")
-TOKENS_DIR = _env_path("YT_ARCHIVER_TOKENS_DIR", PROJECT_ROOT / "tokens")
+CONFIG_DIR = _env_path("RETREIVR_CONFIG_DIR", PROJECT_ROOT / "config")
+DATA_DIR = _env_path("RETREIVR_DATA_DIR", PROJECT_ROOT)
+DOWNLOADS_DIR = _env_path("RETREIVR_DOWNLOADS_DIR", PROJECT_ROOT / "downloads")
+LOG_DIR = _env_path("RETREIVR_LOG_DIR", PROJECT_ROOT / "logs")
+TOKENS_DIR = _env_path("RETREIVR_TOKENS_DIR", PROJECT_ROOT / "tokens")
 
 
 @dataclass(frozen=True)

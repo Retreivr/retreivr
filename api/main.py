@@ -24,6 +24,7 @@ import mimetypes
 import os
 import sqlite3
 import subprocess
+import shutil
 import tempfile
 import threading
 import time
@@ -33,7 +34,7 @@ from uuid import uuid4
 
 import anyio
 from fastapi import Body, FastAPI, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.errors import HttpError
@@ -44,7 +45,8 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
 from google.auth.exceptions import RefreshError
 
-from engine.job_queue import DownloadWorkerEngine
+from engine.job_queue import DownloadJobStore, DownloadWorkerEngine, preview_direct_url
+from engine.json_utils import json_sanity_check, safe_json, safe_json_dump
 from engine.search_engine import SearchResolutionService, resolve_search_db_path
 from engine.spotify_playlist_importer import (
     SpotifyPlaylistImportError,
@@ -213,6 +215,10 @@ class RunRequest(BaseModel):
     delivery_mode: str | None = None
 
 
+class DirectUrlPreviewRequest(BaseModel):
+    url: str
+
+
 class ConfigPathRequest(BaseModel):
     path: str
 
@@ -270,10 +276,20 @@ class SpotifyPlaylistImportPayload(BaseModel):
     playlist_url: str
 
 
+class SafeJSONResponse(JSONResponse):
+    def render(self, content):
+        return json.dumps(
+            safe_json(content),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
 
 app = FastAPI(
     title=APP_NAME,
     description="Retreivr API for self-hosted playlist archiving, scheduling, and metrics.",
+    default_response_class=SafeJSONResponse,
 )
 
 if _TRUST_PROXY:
@@ -359,6 +375,7 @@ async def startup():
         config=config or {},
         paths=app.state.paths,
     )
+    json_sanity_check()
     if os.environ.get("RETREIVR_DIAG", "").strip().lower() in {"1", "true", "yes"}:
         diag_url = os.environ.get("RETREIVR_DIAG_URL", "https://youtu.be/PmtGDk0c-JM")
         logging.info("RETREIVR_DIAG enabled; running direct URL self-test")
@@ -605,6 +622,252 @@ def _iter_file(path, chunk_size=1024 * 1024):
 
 def _yt_dlp_script_path():
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "update_yt_dlp.sh"))
+
+
+# Fast-lane direct URL download via yt-dlp CLI
+def _run_direct_url_with_cli(
+    *,
+    url: str,
+    paths,
+    config: dict,
+    destination: str | None,
+    final_format_override: str | None,
+    stop_event: threading.Event,
+    status: EngineStatus | None = None,
+):
+    """Fast-lane direct URL download via the yt-dlp CLI.
+
+    Rationale: The CLI behavior is the reference implementation (matches user expectations)
+    and avoids subtle differences vs the Python API wrapper.
+
+    This function is intentionally minimal: download to temp, then atomically move completed
+    files into the destination. Metadata/enrichment can occur post-download.
+    """
+
+    if not url or not isinstance(url, str):
+        raise ValueError("single_url is required")
+
+    # Resolve destination (default to configured DOWNLOADS_DIR)
+    dest_dir = (destination or DOWNLOADS_DIR).strip() if destination else DOWNLOADS_DIR
+    ensure_dir(dest_dir)
+
+    # Direct URL runs are intentionally NOT persisted into the unified download_jobs queue.
+    # They bypass adapters/worker and run yt-dlp CLI synchronously (reference behavior).
+    job_id = uuid4().hex
+
+    # Always download into an isolated job temp dir
+    temp_dir = os.path.join(paths.temp_downloads_dir, job_id)
+    ensure_dir(temp_dir)
+
+
+    # Output template: keep simple and CLI-equivalent
+    # Note: if the template is absolute, yt-dlp ignores --paths; so keep it absolute here.
+    outtmpl = os.path.join(temp_dir, "%(title).200s-%(id)s.%(ext)s")
+
+    def _looks_like_playlist(u: str) -> bool:
+        u = (u or "").lower()
+        # Conservative heuristic: only allow playlist downloads when the user actually pasted a playlist URL.
+        # This keeps single-video URLs behaving like the CLI test (`--no-playlist`).
+        return (
+            "list=" in u
+            or "/playlist" in u
+            or "playlist?" in u
+            or "?playlist" in u
+        )
+
+    args = [
+        "yt-dlp",
+    ]
+
+    # Match the proven CLI behavior for single-video URLs.
+    # If the URL looks like a playlist URL, do NOT add --no-playlist.
+    if not _looks_like_playlist(url):
+        args.append("--no-playlist")
+
+    # Output template
+    args += ["-o", outtmpl]
+
+    # Optional final container override
+    if final_format_override:
+        args += ["--merge-output-format", final_format_override]
+
+    # Cookies are NOT passed by default for the fast lane.
+    # Rationale: user verified the minimal CLI works reliably without cookies; cookies can change
+    # selected formats/auth flows and can trigger fragment 403s depending on the session.
+    # If you want cookies for a specific site, add a config flag later (e.g. direct_url_use_cookies).
+
+    args.append(url)
+
+    def _redact_cli_args(argv: list[str]) -> list[str]:
+        redacted: list[str] = []
+        i = 0
+        while i < len(argv):
+            token = argv[i]
+            if token in {"--cookies", "--cookiefile"}:
+                redacted.append(token)
+                if i + 1 < len(argv):
+                    redacted.append("<redacted>")
+                    i += 2
+                    continue
+            redacted.append(token)
+            i += 1
+        return redacted
+
+    logging.info(
+        json.dumps(
+            safe_json(
+                {
+                    "message": "DIRECT_URL_CLI_START",
+                    "url": url,
+                    "job_id": job_id,
+                    "destination": dest_dir,
+                    "outtmpl": outtmpl,
+                    "final_format": final_format_override,
+                    "args": _redact_cli_args(args),
+                }
+            ),
+            sort_keys=True,
+        )
+    )
+
+
+    log_path = os.path.join(temp_dir, "ytdlp.log")
+
+    # Write full yt-dlp output to a log file (avoids stdout pipe buffering issues and keeps
+    # the process behavior closer to a normal CLI run).
+    log_fp = open(log_path, "w", encoding="utf-8", errors="replace")
+    proc = subprocess.Popen(
+        args,
+        stdout=log_fp,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    # Expose for the Kill button path to terminate.
+    try:
+        app.state.current_download_proc = proc
+        app.state.current_download_job_id = job_id
+    except Exception:
+        pass
+
+    try:
+        while True:
+            if stop_event.is_set() or getattr(app.state, "cancel_requested", False):
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                raise RuntimeError("cancelled")
+
+            rc = proc.poll()
+            if rc is not None:
+                break
+            time.sleep(0.1)
+
+        # Close file handle so tail reads see all output.
+        try:
+            log_fp.flush()
+        except Exception:
+            pass
+        try:
+            log_fp.close()
+        except Exception:
+            pass
+
+        if rc != 0:
+            tail = _tail_lines(log_path, 80)
+            raise RuntimeError(f"yt_dlp_cli_failed rc={rc}\n{tail}")
+
+        # Move completed files into destination; ignore temp artifacts.
+        moved = []
+        for root, _dirs, files in os.walk(temp_dir):
+            for name in files:
+                if name.endswith(".part") or name.endswith(".ytdl") or name == "ytdlp.log":
+                    continue
+                src = os.path.join(root, name)
+                if not os.path.isfile(src):
+                    continue
+                dst = os.path.join(dest_dir, name)
+                # Overwrite behavior (CLI default is to overwrite when configured;
+                # ensure we don't fail here).
+                try:
+                    if os.path.exists(dst):
+                        os.remove(dst)
+                except Exception:
+                    pass
+                shutil.move(src, dst)
+                moved.append(dst)
+
+        if not moved:
+            tail = _tail_lines(log_path, 80)
+            raise RuntimeError(f"yt_dlp_cli_no_outputs\n{tail}")
+
+        # Finalize engine status for UI consumers (CLI-equivalent direct URL run)
+        if status is not None:
+            try:
+                status.run_successes = moved
+                status.last_completed_path = moved[-1]
+                status.run_total = len(moved)
+                status.run_failures = []
+                status.completed = True
+                status.completed_at = datetime.now(timezone.utc).isoformat()
+            except Exception:
+                pass
+
+        # Ensure in-memory engine status reflects completion for UI polling.
+        try:
+            if status is not None:
+                status.completed = True
+                status.completed_at = datetime.now(timezone.utc).isoformat()
+                status.run_failures = []
+            app.state.state = "idle"
+        except Exception:
+            pass
+        logging.info(
+            json.dumps(
+                safe_json(
+                    {
+                        "message": "DIRECT_URL_CLI_DONE",
+                        "job_id": job_id,
+                        "files": moved,
+                        "destination": dest_dir,
+                    }
+                ),
+                sort_keys=True,
+            )
+        )
+
+        # Ensure in-memory engine status reflects completion for UI polling.
+        try:
+            if status is not None:
+                status.completed = True
+                status.completed_at = datetime.now(timezone.utc).isoformat()
+                status.run_failures = []
+        except Exception:
+            pass
+
+    finally:
+        # Ensure the log file handle is closed.
+        try:
+            if not log_fp.closed:
+                log_fp.close()
+        except Exception:
+            pass
+        try:
+            if proc and proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        try:
+            app.state.current_download_proc = None
+            app.state.current_download_job_id = None
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def _list_download_files(base_dir):
@@ -953,7 +1216,7 @@ def _read_config_or_404():
     if errors:
         raise HTTPException(status_code=400, detail={"errors": errors})
     _warn_deprecated_fields(config)
-    return _strip_deprecated_fields(config)
+    return safe_json(_strip_deprecated_fields(config))
 
 
 def _read_config_for_scheduler():
@@ -1063,21 +1326,33 @@ async def _start_run_with_config(
                         mode=playlist_mode or "full",
                     )
                 else:
-                    run_callable = functools.partial(
-                        run_archive,
-                        config,
-                        paths=app.state.paths,
-                        status=status,
-                        single_url=single_url,
-                        destination=destination,
-                        final_format_override=final_format_override,
-                        js_runtime_override=js_runtime,
-                        stop_event=app.state.stop_event,
-                        run_source=run_source,
-                        music_mode=bool(music_mode) if music_mode is not None else False,
-                        skip_downtime=skip_downtime,
-                        delivery_mode=delivery_mode or "server",
-                    )
+                    if single_url:
+                        run_callable = functools.partial(
+                            _run_direct_url_with_cli,
+                            url=single_url,
+                            paths=app.state.paths,
+                            config=config,
+                            destination=destination,
+                            final_format_override=final_format_override,
+                            stop_event=app.state.stop_event,
+                            status=status,
+                        )
+                    else:
+                        run_callable = functools.partial(
+                            run_archive,
+                            config,
+                            paths=app.state.paths,
+                            status=status,
+                            single_url=single_url,
+                            destination=destination,
+                            final_format_override=final_format_override,
+                            js_runtime_override=js_runtime,
+                            stop_event=app.state.stop_event,
+                            run_source=run_source,
+                            music_mode=bool(music_mode) if music_mode is not None else False,
+                            skip_downtime=skip_downtime,
+                            delivery_mode=delivery_mode or "server",
+                        )
                 await anyio.to_thread.run_sync(run_callable)
                 if app.state.stop_event.is_set():
                     if app.state.cancel_requested:
@@ -1090,6 +1365,13 @@ async def _start_run_with_config(
                 app.state.last_error = str(exc)
                 app.state.state = "error"
             finally:
+                # Ensure CLI process isn't left running
+                try:
+                    proc = getattr(app.state, "current_download_proc", None)
+                    if proc and proc.poll() is None:
+                        proc.terminate()
+                except Exception:
+                    pass
                 app.state.running = False
                 app.state.finished_at = datetime.now(timezone.utc).isoformat()
                 if app.state.cancel_requested:
@@ -1101,7 +1383,7 @@ async def _start_run_with_config(
                     _cleanup_dir(app.state.paths.ytdlp_temp_dir)
                     logging.info("Downloads cancelled by user")
                     logging.info("State reset to idle")
-                elif app.state.state == "running":
+                elif app.state.state in {"running", "completed"}:
                     app.state.state = "idle"
 
         app.state.run_task = asyncio.create_task(_runner())
@@ -2138,7 +2420,7 @@ async def api_status():
     watcher_status = dict(getattr(app.state, "watcher_status", {}) or {})
     if not bool(getattr(app.state, "watcher_lock", None)):
         watcher_status["state"] = "disabled"
-    return {
+    return safe_json({
         "schema_version": STATUS_SCHEMA_VERSION,
         "server_time": datetime.now(timezone.utc).isoformat(),
         "state": app.state.state,
@@ -2157,7 +2439,7 @@ async def api_status():
         },
         "watcher_errors": watcher_errors,
         "status": status,
-    }
+    })
 
 
 @app.get("/api/schedule")
@@ -2182,7 +2464,7 @@ async def api_update_schedule(payload: ScheduleRequest):
 
     tmp = tempfile.NamedTemporaryFile("w", delete=False, dir=config_dir)
     try:
-        json.dump(config, tmp, indent=4)
+        safe_json_dump(config, tmp, indent=4)
         tmp.flush()
         os.fsync(tmp.fileno())
         tmp.close()
@@ -2310,7 +2592,7 @@ async def api_oauth_complete(payload: OAuthCompleteRequest):
     }
     ensure_dir(os.path.dirname(token_file))
     with open(token_file, "w") as f:
-        json.dump(token_data, f, indent=2)
+        safe_json_dump(token_data, f, indent=2)
     account = session.get("account") or "unknown"
     logging.info("OAuth token saved for account %s to %s", account, token_file)
     return {"status": "ok", "token_path": token_file}
@@ -2377,9 +2659,25 @@ async def api_run(request: RunRequest):
     return {"run_id": app.state.run_id, "status": "started"}
 
 
+@app.post("/api/direct_url_preview")
+async def api_direct_url_preview(request: DirectUrlPreviewRequest):
+    url = request.url.strip() if request.url else ""
+    if not url:
+        raise HTTPException(status_code=400, detail="URL is required")
+    config = _read_config_or_404()
+    try:
+        preview = preview_direct_url(url, config)
+    except Exception as exc:
+        logging.exception("Direct URL preview failed: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return safe_json({"preview": preview})
+
+
 @app.post("/api/cancel")
 async def api_cancel():
     logging.info("Cancel requested by user")
+    store = DownloadJobStore(app.state.paths.db_path)
+    store.cancel_active_jobs(reason="cancel_requested")
     if not app.state.running:
         return {"status": "idle"}
     app.state.cancel_requested = True
@@ -2533,7 +2831,10 @@ async def list_download_jobs(limit: int = 100, status: str | None = None):
     conn = sqlite3.connect(app.state.paths.db_path)
     try:
         cur = conn.cursor()
-        query = "SELECT id, origin, source, media_intent, status, attempts, created_at, last_error FROM download_jobs"
+        query = (
+            "SELECT id, origin, origin_id, url, source, media_intent, status, attempts, created_at, last_error "
+            "FROM download_jobs"
+        )
         params = []
         if status:
             query += " WHERE status=?"
@@ -2547,18 +2848,20 @@ async def list_download_jobs(limit: int = 100, status: str | None = None):
             {
                 "id": row[0],
                 "origin": row[1],
-                "source": row[2],
-                "media_intent": row[3],
-                "status": row[4],
-                "attempts": row[5],
-                "created_at": row[6],
-                "last_error": row[7],
+                "origin_id": row[2],
+                "url": row[3],
+                "source": row[4],
+                "media_intent": row[5],
+                "status": row[6],
+                "attempts": row[7],
+                "created_at": row[8],
+                "last_error": row[9],
             }
             for row in cur.fetchall()
         ]
     finally:
         conn.close()
-    return {"jobs": rows}
+    return safe_json({"jobs": rows})
 
 
 
@@ -2582,7 +2885,7 @@ async def api_put_config(payload: dict = Body(...)):
 
     tmp = tempfile.NamedTemporaryFile("w", delete=False, dir=config_dir)
     try:
-        json.dump(payload, tmp, indent=4)
+        safe_json_dump(payload, tmp, indent=4)
         tmp.flush()
         os.fsync(tmp.fileno())
         tmp.close()
