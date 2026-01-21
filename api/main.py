@@ -375,9 +375,17 @@ async def startup():
         config=config or {},
         paths=app.state.paths,
     )
-    # Ensure search DB schema exists before any read operations
+    # Ensure search DB schema exists before any read operations.
+    # Older/newer versions of SearchResolutionService expose this differently.
     try:
-        app.state.search_service.ensure_schema()
+        if hasattr(app.state.search_service, "ensure_schema"):
+            app.state.search_service.ensure_schema()
+        elif hasattr(app.state.search_service, "store") and hasattr(app.state.search_service.store, "ensure_schema"):
+            app.state.search_service.store.ensure_schema()
+        elif hasattr(app.state.search_service, "job_store") and hasattr(app.state.search_service.job_store, "ensure_schema"):
+            app.state.search_service.job_store.ensure_schema()
+        else:
+            logging.warning("Search DB schema initializer not found on SearchResolutionService; continuing")
     except Exception:
         logging.exception("Failed to initialize search DB schema")
         raise
@@ -1375,13 +1383,21 @@ async def _start_run_with_config(
         app.state.stop_event = threading.Event()
 
         async def _runner():
-            if final_format_override is None:
-                final_format_override = (
+            effective_final_format_override = final_format_override
+            if effective_final_format_override is None:
+                effective_final_format_override = (
                     config.get("default_video_format")
                     or config.get("final_format")
                     or "webm"
                 )
             try:
+                logging.info(
+                    "Run runner entered run_id=%s source=%s single_url=%s playlist_id=%s",
+                    app.state.run_id,
+                    run_source,
+                    bool(single_url),
+                    bool(playlist_id),
+                )
                 if run_source == "watcher":
                     logging.info("Watcher-triggered run starting")
                 elif run_source == "scheduled":
@@ -1395,7 +1411,7 @@ async def _start_run_with_config(
                         playlist_id,
                         destination,
                         playlist_account,
-                        final_format_override,
+                        effective_final_format_override,
                         paths=app.state.paths,
                         status=status,
                         js_runtime_override=js_runtime,
@@ -1411,7 +1427,7 @@ async def _start_run_with_config(
                             paths=app.state.paths,
                             config=config,
                             destination=destination,
-                            final_format_override=final_format_override,
+                            final_format_override=effective_final_format_override,
                             stop_event=app.state.stop_event,
                             status=status,
                         )
@@ -1423,7 +1439,7 @@ async def _start_run_with_config(
                             status=status,
                             single_url=single_url,
                             destination=destination,
-                            final_format_override=final_format_override,
+                            final_format_override=effective_final_format_override,
                             js_runtime_override=js_runtime,
                             stop_event=app.state.stop_event,
                             run_source=run_source,
@@ -1438,6 +1454,7 @@ async def _start_run_with_config(
                         status.completed = True
                         status.completed_at = datetime.now(timezone.utc).isoformat()
                         app.state.state = "idle"
+                        app.state.last_error = None
                     except Exception:
                         pass
                 if app.state.stop_event.is_set():
