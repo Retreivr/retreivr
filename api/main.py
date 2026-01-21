@@ -761,7 +761,15 @@ def _run_direct_url_with_cli(
 
     # Optional final container override
     if final_format_override:
-        args += ["--merge-output-format", final_format_override]
+        fmt = final_format_override.strip().lower()
+        audio_formats = {"mp3", "m4a", "flac", "wav", "opus", "ogg"}
+        video_formats = {"webm", "mp4", "mkv"}
+        if fmt in audio_formats:
+            args += ["-f", "bestaudio", "--extract-audio", "--audio-format", fmt]
+        elif fmt in video_formats:
+            args += ["--merge-output-format", fmt]
+        else:
+            args += ["--merge-output-format", final_format_override]
 
     # Cookies are NOT passed by default for the fast lane.
     # Rationale: user verified the minimal CLI works reliably without cookies; cookies can change
