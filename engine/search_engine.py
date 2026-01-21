@@ -810,7 +810,8 @@ class SearchResolutionService:
             )
 
             if not auto_enqueue:
-                # Invariant B: search-only requests never enqueue download jobs.
+                # Invariant B: search-only requests never auto-enqueue download jobs.
+                # Manual enqueue via API is always allowed.
                 continue
 
             # Do not enqueue downloads from search for playlists (must bypass search)
@@ -962,9 +963,6 @@ class SearchResolutionService:
         request = self.store.get_request_row(item.get("request_id"))
         if not request:
             return None
-        if request.get("auto_enqueue") in (0, False):
-            # Invariant B: search-only requests must never enqueue jobs.
-            raise ValueError("search_only_request_no_enqueue")
 
         destination_dir = request.get("destination_dir") or None
         output_template = None

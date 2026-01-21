@@ -1369,6 +1369,12 @@ async def _start_run_with_config(
         app.state.stop_event = threading.Event()
 
         async def _runner():
+            if final_format_override is None:
+                final_format_override = (
+                    config.get("default_video_format")
+                    or config.get("final_format")
+                    or "webm"
+                )
             try:
                 if run_source == "watcher":
                     logging.info("Watcher-triggered run starting")
@@ -1420,6 +1426,14 @@ async def _start_run_with_config(
                             delivery_mode=delivery_mode or "server",
                         )
                 await anyio.to_thread.run_sync(run_callable)
+                # Ensure UI state finalization for direct URL runs
+                if single_url:
+                    try:
+                        status.completed = True
+                        status.completed_at = datetime.now(timezone.utc).isoformat()
+                        app.state.state = "idle"
+                    except Exception:
+                        pass
                 if app.state.stop_event.is_set():
                     if app.state.cancel_requested:
                         app.state.last_error = "Downloads cancelled by user"
