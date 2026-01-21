@@ -232,7 +232,7 @@ This preserves your config, database, logs, tokens, and downloads.
 ## Versioning (Docker builds)
 The app reads its version from `RETREIVR_VERSION`. The Dockerfile exposes a build arg:
 ```bash
-docker build -f docker/Dockerfile --build-arg RETRIEVR_VERSION=0.9.0 -t retreivr:latest .
+docker build -f docker/Dockerfile --build-arg RETRIEVR_VERSION=0.9.1 -t retreivr:latest .
 ```
 This avoids keeping the version in Compose or runtime envs.
 

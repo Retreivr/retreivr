@@ -16,6 +16,9 @@ Fixed:
 - Ensured scheduler and direct downloads can run concurrently without interference.
 - Fixed missing database schema initialization for search-related tables.
 - Normalized all filesystem paths via paths.py and environment variables (Docker-safe).
+- Fixed Advanced Search “Failed to load requests” error caused by search DB store calling service-only logic.
+- Fixed Home screen results remaining stuck in “Queued” by restoring reliable search request status hydration.
+- Unified search job database usage to a single canonical path to prevent schema and state mismatches.
 
 Changed:
 - Direct URL playlist links are now explicitly rejected with a clear user-facing error message.

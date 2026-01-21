@@ -1,4 +1,4 @@
-# Retreivr — Portainer Deployment (Docker Standalone) — v0.9.0
+# Retreivr — Portainer Deployment (Docker Standalone) — v0.9.1
 
 This guide shows how to deploy Retreivr using Portainer Stacks, using the already-published image.
 Example portainer-friendly docker-compose.yml file is located in /docker folder.
@@ -29,7 +29,7 @@ version: "3.9"
 
 services:
   retreivr:
-    image: retreivr/retreivr:0.9.0
+    image: retreivr/retreivr:0.9.1
     container_name: retreivr
     ports:
       - "8090:8000"
@@ -55,7 +55,7 @@ version: "3.9"
 
 services:
   retreivr:
-    image: ghcr.io/retreivr/retreivr:0.9.0
+    image: ghcr.io/retreivr/retreivr:0.9.1
     container_name: retreivr
     ports:
       - "8090:8000"
