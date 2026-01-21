@@ -4,21 +4,12 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = Path(os.environ.get("RETREIVR_DATA_DIR", PROJECT_ROOT / "data")).resolve()
 
-
-def _env_path(name, default):
-    value = os.environ.get(name)
-    if value:
-        return os.path.abspath(value)
-    return os.path.abspath(default)
-
-
-# Base directories for all file access. Override via env for container mounts.
-CONFIG_DIR = _env_path("RETREIVR_CONFIG_DIR", PROJECT_ROOT / "config")
-DATA_DIR = _env_path("RETREIVR_DATA_DIR", PROJECT_ROOT)
-DOWNLOADS_DIR = _env_path("RETREIVR_DOWNLOADS_DIR", PROJECT_ROOT / "downloads")
-LOG_DIR = _env_path("RETREIVR_LOG_DIR", PROJECT_ROOT / "logs")
-TOKENS_DIR = _env_path("RETREIVR_TOKENS_DIR", PROJECT_ROOT / "tokens")
+CONFIG_DIR = Path(os.environ.get("RETREIVR_CONFIG_DIR", DATA_DIR / "config")).resolve()
+DOWNLOADS_DIR = Path(os.environ.get("RETREIVR_DOWNLOADS_DIR", DATA_DIR / "downloads")).resolve()
+LOG_DIR = Path(os.environ.get("RETREIVR_LOG_DIR", DATA_DIR / "logs")).resolve()
+TOKENS_DIR = Path(os.environ.get("RETREIVR_TOKENS_DIR", DATA_DIR / "tokens")).resolve()
 
 
 @dataclass(frozen=True)
@@ -69,17 +60,32 @@ def resolve_dir(path, base_dir):
 
 
 def build_engine_paths():
-    db_path = os.path.join(DATA_DIR, "database", "db.sqlite")
-    temp_downloads_dir = os.path.join(DATA_DIR, "temp_downloads")
-    lock_file = os.path.join(DATA_DIR, "tmp", "yt_archiver.lock")
-    ytdlp_temp_dir = os.path.join(DATA_DIR, "tmp", "yt-dlp")
-    thumbs_dir = os.path.join(ytdlp_temp_dir, "thumbs")
+    db_path = DATA_DIR / "database" / "db.sqlite"
+    temp_downloads_dir = DATA_DIR / "temp_downloads"
+    lock_file = DATA_DIR / "tmp" / "retreivr.lock"
+    ytdlp_temp_dir = DATA_DIR / "tmp" / "yt-dlp"
+    thumbs_dir = ytdlp_temp_dir / "thumbs"
+
+    # Ensure required directories exist
+    for d in (
+        db_path.parent,
+        temp_downloads_dir,
+        lock_file.parent,
+        ytdlp_temp_dir,
+        thumbs_dir,
+        LOG_DIR,
+        DOWNLOADS_DIR,
+        TOKENS_DIR,
+        CONFIG_DIR,
+    ):
+        ensure_dir(d)
+
     return EnginePaths(
-        log_dir=LOG_DIR,
-        db_path=db_path,
-        temp_downloads_dir=temp_downloads_dir,
-        single_downloads_dir=DOWNLOADS_DIR,
-        lock_file=lock_file,
-        ytdlp_temp_dir=ytdlp_temp_dir,
-        thumbs_dir=thumbs_dir,
+        log_dir=str(LOG_DIR),
+        db_path=str(db_path),
+        temp_downloads_dir=str(temp_downloads_dir),
+        single_downloads_dir=str(DOWNLOADS_DIR),
+        lock_file=str(lock_file),
+        ytdlp_temp_dir=str(ytdlp_temp_dir),
+        thumbs_dir=str(thumbs_dir),
     )
