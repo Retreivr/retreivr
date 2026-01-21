@@ -104,6 +104,8 @@ const HOME_STATUS_CLASS_MAP = {
 };
 const HOME_FINAL_STATUSES = new Set(["completed", "completed_with_skips", "failed"]);
 const HOME_RESULT_TIMEOUT_MS = 18000;
+const DIRECT_URL_PLAYLIST_ERROR =
+  "Playlist URLs are not supported in Direct URL mode. Please add this playlist via Scheduler or Playlist settings.";
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -1983,17 +1985,50 @@ function renderHomeDirectUrlCard(preview, status) {
     source: preview.source || "direct",
     url: preview.url,
     thumbnail_url: preview.thumbnail_url,
-    allow_download: true,
+    allow_download: preview.allow_download !== false,
     job_status: preview.job_status || "",
   };
   const item = {
     id: "direct-url-item",
     status,
-    allow_download: true,
+    allow_download: preview.allow_download !== false,
   };
   candidateList.appendChild(renderHomeCandidateRow(candidate, item));
   card.appendChild(candidateList);
   return card;
+}
+
+function showHomeDirectUrlError(url, message, messageEl) {
+  const text = message || DIRECT_URL_PLAYLIST_ERROR;
+  if (messageEl) {
+    setNotice(messageEl, text, true);
+  }
+  stopHomeDirectJobPolling();
+  stopHomeResultPolling();
+  state.homeSearchMode = "searchOnly";
+  state.homeDirectJob = null;
+  state.homeDirectPreview = {
+    title: url,
+    url,
+    source: "direct",
+    uploader: null,
+    thumbnail_url: null,
+    allow_download: false,
+    job_status: "failed",
+  };
+  state.homeSearchRequestId = null;
+  state.homeRequestContext = {};
+  state.homeBestScores = {};
+  state.homeCandidateCache = {};
+  state.homeCandidatesLoading = {};
+  showHomeResults(true);
+  setHomeResultsStatus("Failed");
+  setHomeResultsDetail(text, true);
+  const container = $("#home-results-list");
+  if (container) {
+    container.textContent = "";
+    container.appendChild(renderHomeDirectUrlCard(state.homeDirectPreview, "failed"));
+  }
 }
 
 function showHomeDirectUrlPreview(preview) {
@@ -2294,12 +2329,12 @@ async function handleHomeDirectUrl(url, destination, messageEl) {
   const formatOverride = $("#home-format")?.value.trim();
   const treatAsMusic = $("#home-treat-music")?.checked ?? false;
   const playlistId = extractPlaylistIdFromUrl(url);
-  const payload = {};
   if (playlistId) {
-    payload.playlist_id = playlistId;
-  } else {
-    payload.single_url = url;
+    showHomeDirectUrlError(url, DIRECT_URL_PLAYLIST_ERROR, messageEl);
+    return;
   }
+  const payload = {};
+  payload.single_url = url;
   if (destination) {
     payload.destination = destination;
   }
@@ -2345,6 +2380,11 @@ async function handleHomeDirectUrl(url, destination, messageEl) {
 
 async function handleHomeDirectUrlPreview(url, destination, messageEl) {
   if (!messageEl) return;
+  const playlistId = extractPlaylistIdFromUrl(url);
+  if (playlistId) {
+    showHomeDirectUrlError(url, DIRECT_URL_PLAYLIST_ERROR, messageEl);
+    return;
+  }
   setNotice(messageEl, "Fetching URL metadata...", false);
   try {
     const data = await fetchJson("/api/direct_url_preview", {

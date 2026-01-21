@@ -107,6 +107,10 @@ _OAUTH_LOCK = threading.Lock()
 _DEPRECATED_FIELDS = {"poll_interval_hours"}
 _DEPRECATED_LOGGED = set()
 _MULTI_WORKER_ENV_KEYS = ("UVICORN_WORKERS", "WEB_CONCURRENCY", "GUNICORN_WORKERS")
+DIRECT_URL_PLAYLIST_ERROR = (
+    "Playlist URLs are not supported in Direct URL mode. "
+    "Please add this playlist via Scheduler or Playlist settings."
+)
 
 WEBUI_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "webUI"))
 
@@ -114,6 +118,20 @@ WEBUI_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "webUI
 def _env_or_default(name, default):
     value = os.environ.get(name)
     return value if value else default
+
+
+def _looks_like_playlist_url(value):
+    if not value or not isinstance(value, str):
+        return False
+    if extract_playlist_id(value):
+        return True
+    lowered = value.lower()
+    return (
+        "list=" in lowered
+        or "/playlist" in lowered
+        or "playlist?" in lowered
+        or "?playlist" in lowered
+    )
 
 
 def _check_basic_auth(header_value):
@@ -2743,6 +2761,8 @@ async def api_run(request: RunRequest):
     config = _read_config_or_404()
     if request.single_url and request.playlist_id:
         raise HTTPException(status_code=400, detail="Provide either single_url or playlist_id, not both")
+    if request.single_url and _looks_like_playlist_url(request.single_url):
+        raise HTTPException(status_code=400, detail=DIRECT_URL_PLAYLIST_ERROR)
     if request.playlist_account:
         accounts = (config.get("accounts") or {}) if isinstance(config, dict) else {}
         if request.playlist_account not in accounts:
@@ -2775,6 +2795,8 @@ async def api_direct_url_preview(request: DirectUrlPreviewRequest):
     url = request.url.strip() if request.url else ""
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
+    if _looks_like_playlist_url(url):
+        raise HTTPException(status_code=400, detail=DIRECT_URL_PLAYLIST_ERROR)
     config = _read_config_or_404()
     try:
         preview = preview_direct_url(url, config)
