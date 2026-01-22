@@ -883,7 +883,7 @@ def _run_direct_url_with_cli(
                     proc.terminate()
                 except Exception:
                     pass
-                raise RuntimeError("cancelled")
+                raise RuntimeError("direct_url_cancelled")
 
             rc = proc.poll()
             if rc is not None:
@@ -1517,9 +1517,15 @@ async def _start_run_with_config(
                         app.state.last_error = "Run stopped"
                     app.state.state = "error"
             except Exception as exc:
-                logging.exception("Archive run failed: %s", exc)
-                app.state.last_error = str(exc)
-                app.state.state = "error"
+                # Direct URL cancel should not surface as a generic error state.
+                if str(exc) == "direct_url_cancelled" or getattr(app.state, "cancel_requested", False):
+                    app.state.cancel_requested = False
+                    app.state.last_error = "Downloads cancelled by user"
+                    app.state.state = "idle"
+                else:
+                    logging.exception("Archive run failed: %s", exc)
+                    app.state.last_error = str(exc)
+                    app.state.state = "error"
             finally:
                 # Ensure CLI process isn't left running
                 try:
@@ -1545,6 +1551,48 @@ async def _start_run_with_config(
         app.state.run_task = asyncio.create_task(_runner())
 
     return "started", None
+
+
+# Cancel endpoint for jobs (API-level)
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str, payload: CancelJobRequest = Body(default=CancelJobRequest())):
+    """
+    Cancel a queued/active download job.
+
+    Behavior:
+    - If the job corresponds to the direct-URL fast-lane, terminate the active yt-dlp CLI subprocess.
+    - If the job is a queued worker job, mark it CANCELLED in the download_jobs table and request
+      cancellation from the worker engine.
+    """
+    reason = (payload.reason or "Cancelled by user").strip() if payload else "Cancelled by user"
+
+    # 1) Direct URL fast-lane: terminate current CLI process (if this matches)
+    try:
+        current_job_id = getattr(app.state, "current_download_job_id", None)
+        current_proc = getattr(app.state, "current_download_proc", None)
+        if current_job_id and current_job_id == job_id and current_proc:
+            app.state.cancel_requested = True
+            await anyio.to_thread.run_sync(_terminate_subprocess, current_proc)
+            return {"ok": True, "job_id": job_id, "status": "cancelled", "scope": "direct_url"}
+    except Exception:
+        logging.exception("Direct URL cancel path failed")
+
+    # 2) Unified queue jobs: mark cancelled and ask worker to stop
+    try:
+        engine = getattr(app.state, "worker_engine", None)
+        if engine is not None and hasattr(engine, "cancel_job") and callable(getattr(engine, "cancel_job")):
+            try:
+                engine.cancel_job(job_id, reason=reason)
+            except TypeError:
+                engine.cancel_job(job_id)
+            return {"ok": True, "job_id": job_id, "status": "cancelled", "scope": "queue"}
+        # Fallback if engine isn't available for some reason: mark cancelled in DB.
+        store = DownloadJobStore(app.state.paths.db_path)
+        store.mark_canceled(job_id, reason=reason)
+        return {"ok": True, "job_id": job_id, "status": "cancelled", "scope": "queue"}
+    except Exception as exc:
+        logging.exception("Cancel job failed")
+        raise HTTPException(status_code=500, detail=f"Cancel failed: {exc}")
 
 
 def _get_next_run_iso():
