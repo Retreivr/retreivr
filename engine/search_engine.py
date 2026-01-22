@@ -60,7 +60,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from engine.job_queue import DownloadJobStore, build_output_template, ensure_download_jobs_table
+from engine.job_queue import DownloadJobStore, build_output_template, ensure_download_jobs_table, canonicalize_url
 from engine.json_utils import safe_json_dumps
 from engine.paths import DATA_DIR
 from engine.search_adapters import default_adapters
@@ -1046,6 +1046,8 @@ class SearchResolutionService:
             canonical_id = _extract_canonical_id(canonical_for_job or chosen)
             trace_id = uuid4().hex
             media_intent = "album" if item["item_type"] == "album" else "track"
+            external_id = chosen.get("external_id") if isinstance(chosen, dict) else None
+            canonical_url = canonicalize_url(chosen.get("source"), chosen.get("url"), external_id)
             job_id, created, dedupe_reason = self.queue_store.enqueue_job(
                 origin=job_origin,
                 origin_id=request_id,
@@ -1053,6 +1055,9 @@ class SearchResolutionService:
                 media_intent=media_intent,
                 source=chosen["source"],
                 url=chosen["url"],
+                input_url=chosen.get("url"),
+                canonical_url=canonical_url,
+                external_id=external_id,
                 output_template=output_template,
                 trace_id=trace_id,
                 resolved_destination=resolved_destination,
@@ -1187,6 +1192,8 @@ class SearchResolutionService:
         canonical_id = _extract_canonical_id(canonical_payload or candidate)
         trace_id = uuid4().hex
         media_intent = "album" if item.get("item_type") == "album" else "track"
+        external_id = candidate.get("external_id") if isinstance(candidate, dict) else None
+        canonical_url = canonicalize_url(candidate.get("source"), candidate_url, external_id)
         job_id, created, dedupe_reason = self.queue_store.enqueue_job(
             origin="search",
             origin_id=request["id"],
@@ -1194,6 +1201,9 @@ class SearchResolutionService:
             media_intent=media_intent,
             source=candidate.get("source"),
             url=candidate_url,
+            input_url=candidate_url,
+            canonical_url=canonical_url,
+            external_id=external_id,
             output_template=output_template,
             trace_id=trace_id,
             resolved_destination=resolved_destination,

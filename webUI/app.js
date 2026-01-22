@@ -1609,7 +1609,11 @@ function setHomeResultsDetail(text, isError = false) {
 function buildHomeResultsStatusInfo(requestId) {
   const context = state.homeRequestContext[requestId];
   if (!context) {
-    return { text: "Waiting for search", detail: "", isError: false };
+    return {
+      text: "Searching sources…",
+      detail: "Results appear as soon as each source responds.",
+      isError: false
+    };
   }
   const request = context.request || {};
   const items = context.items || [];
@@ -1648,21 +1652,25 @@ function buildHomeResultsStatusInfo(requestId) {
 
   if (!items.length) {
     const searchingStates = new Set(["pending", "resolving"]);
-    if (searchingStates.has(requestStatus) && adaptersTotal !== null && adaptersCompleted !== null) {
-      return {
-        text: `Searching sources (${adaptersCompleted}/${adaptersTotal})`,
-        detail: "Results appear as soon as sources return matches.",
-        isError: false,
-        status: requestStatus,
-      };
+    if (searchingStates.has(requestStatus)) {
+      if (adaptersTotal !== null && adaptersCompleted !== null) {
+        return {
+          text: `Searching sources (${adaptersCompleted}/${adaptersTotal})`,
+          detail: "Results stream in as they are found.",
+          isError: false,
+          status: requestStatus,
+        };
+      } else {
+        return {
+          text: "Searching sources…",
+          detail: "Results stream in as they are found.",
+          isError: false,
+          status: requestStatus,
+        };
+      }
     }
-    const fallback = searchingStates.has(requestStatus)
-      ? "Searching for media…"
-      : formatHomeRequestStatus(requestStatus);
-    const detail = searchingStates.has(requestStatus)
-      ? "Search Only shows results as soon as adapters return matches."
-      : "";
-    return { text: fallback, detail, isError: false, status: requestStatus };
+    const fallback = formatHomeRequestStatus(requestStatus);
+    return { text: fallback, detail: "", isError: false, status: requestStatus };
   }
 
   if (hasQueued || requestStatus === "completed_with_skips") {
@@ -1915,15 +1923,29 @@ async function loadHomeCandidates(item, container) {
 function renderHomeCandidateRow(candidate, item) {
   const row = document.createElement("div");
   row.className = "home-candidate-row";
-  const artworkUrl = Array.isArray(candidate.canonical_metadata?.artwork)
-    ? candidate.canonical_metadata.artwork[0].url
-    : candidate.canonical_metadata?.thumbnail;
+  const artworkUrl =
+    (Array.isArray(candidate.canonical_metadata?.artwork)
+      ? candidate.canonical_metadata.artwork[0]?.url
+      : null) ||
+    candidate.canonical_metadata?.thumbnail ||
+    candidate.thumbnail_url ||
+    null;
   const artwork = document.createElement("div");
   artwork.className = "home-candidate-artwork";
+  artwork.style.width = "96px";
+  artwork.style.minWidth = "96px";
+  artwork.style.height = "96px";
+  artwork.style.display = "flex";
+  artwork.style.alignItems = "center";
+  artwork.style.justifyContent = "center";
   if (artworkUrl) {
     const img = document.createElement("img");
     img.src = artworkUrl;
     img.alt = candidate.source || "";
+    img.style.maxWidth = "100%";
+    img.style.maxHeight = "100%";
+    img.style.objectFit = "cover";
+    img.style.borderRadius = "4px";
     artwork.appendChild(img);
   } else {
     artwork.innerHTML = "";
@@ -2254,7 +2276,7 @@ async function refreshHomeResults(requestId) {
       container.textContent = "";
       const placeholder = document.createElement("div");
       placeholder.className = "home-results-empty";
-      placeholder.textContent = "Waiting for items…";
+      placeholder.textContent = "Searching sources…";
       container.appendChild(placeholder);
       return requestStatus;
     }
@@ -3995,3 +4017,25 @@ async function init() {
 }
 
 window.addEventListener("DOMContentLoaded", init);
+
+// Add Enter key handler for home search input to trigger "Search Only"
+document.addEventListener("DOMContentLoaded", () => {
+  const homeSearchInput = $("#home-search-input");
+  if (homeSearchInput) {
+    homeSearchInput.addEventListener("keydown", (event) => {
+      if (
+        event.key === "Enter" &&
+        !event.shiftKey &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !event.metaKey
+      ) {
+        event.preventDefault();
+        const searchOnlyBtn = $("#home-search-only");
+        if (searchOnlyBtn && !searchOnlyBtn.disabled) {
+          searchOnlyBtn.click();
+        }
+      }
+    });
+  }
+});

@@ -47,7 +47,14 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
 from google.auth.exceptions import RefreshError
 
-from engine.job_queue import DownloadJobStore, DownloadWorkerEngine, preview_direct_url
+from engine.job_queue import (
+    DownloadJobStore,
+    DownloadWorkerEngine,
+    preview_direct_url,
+    canonicalize_url,
+    resolve_source,
+    extract_video_id,
+)
 from engine.json_utils import json_sanity_check, safe_json, safe_json_dump
 from engine.search_engine import SearchJobStore, SearchResolutionService, resolve_search_db_path
 from engine.spotify_playlist_importer import (
@@ -724,12 +731,34 @@ def _record_direct_url_history(db_path, files, source_url):
             status TEXT,
             created_at TEXT,
             completed_at TEXT,
-            file_size_bytes INTEGER
+            file_size_bytes INTEGER,
+            input_url TEXT,
+            canonical_url TEXT,
+            external_id TEXT
         )
         """
     )
+    cur.execute("PRAGMA table_info(download_history)")
+    existing_columns = {row[1] for row in cur.fetchall()}
+    for column in ("input_url", "canonical_url", "external_id", "source"):
+        if column not in existing_columns:
+            cur.execute(f"ALTER TABLE download_history ADD COLUMN {column} TEXT")
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_download_history_source_extid "
+        "ON download_history (source, external_id)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_download_history_canonical_url "
+        "ON download_history (canonical_url)"
+    )
 
     now = datetime.now(timezone.utc).isoformat()
+    input_url = source_url
+    source = resolve_source(source_url) if source_url else None
+    if source == "unknown":
+        source = None
+    external_id = extract_video_id(source_url) if source in {"youtube", "youtube_music"} else None
+    canonical_url = canonicalize_url(source, input_url, external_id)
     for path in files:
         try:
             stat = os.stat(path)
@@ -739,20 +768,27 @@ def _record_direct_url_history(db_path, files, source_url):
         cur.execute(
             """
             INSERT INTO download_history
-                (video_id, title, filename, destination, source, status, created_at, completed_at, file_size_bytes)
+                (
+                    video_id, title, filename, destination, source, status,
+                    created_at, completed_at, file_size_bytes,
+                    input_url, canonical_url, external_id
+                )
             VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 None,
                 os.path.basename(path),
                 os.path.basename(path),
                 os.path.dirname(path),
-                source_url,
+                source,
                 "completed",
                 now,
                 now,
                 int(stat.st_size),
+                input_url,
+                canonical_url,
+                external_id,
             ),
         )
 

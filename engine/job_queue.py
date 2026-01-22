@@ -98,6 +98,9 @@ class DownloadJob:
     media_intent: str
     source: str
     url: str
+    input_url: str | None
+    canonical_url: str | None
+    external_id: str | None
     status: str
     queued: str | None
     claimed: str | None
@@ -142,6 +145,9 @@ def ensure_download_jobs_table(conn):
             media_intent TEXT NOT NULL,
             source TEXT NOT NULL,
             url TEXT NOT NULL,
+            input_url TEXT,
+            canonical_url TEXT,
+            external_id TEXT,
             status TEXT NOT NULL,
             queued TEXT,
             claimed TEXT,
@@ -172,6 +178,9 @@ def ensure_download_jobs_table(conn):
         "resolved_destination",
         "canonical_id",
         "file_path",
+        "input_url",
+        "canonical_url",
+        "external_id",
     ):
         if column not in existing_columns:
             cur.execute(f"ALTER TABLE download_jobs ADD COLUMN {column} TEXT")
@@ -197,6 +206,43 @@ def ensure_downloads_table(conn):
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_downloads_downloaded_at ON downloads (downloaded_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_downloads_playlist_id ON downloads (playlist_id)")
+    conn.commit()
+
+
+def ensure_download_history_table(conn):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS download_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id TEXT,
+            title TEXT,
+            filename TEXT,
+            destination TEXT,
+            source TEXT,
+            status TEXT,
+            created_at TEXT,
+            completed_at TEXT,
+            file_size_bytes INTEGER,
+            input_url TEXT,
+            canonical_url TEXT,
+            external_id TEXT
+        )
+        """
+    )
+    cur.execute("PRAGMA table_info(download_history)")
+    existing_columns = {row[1] for row in cur.fetchall()}
+    for column in ("input_url", "canonical_url", "external_id", "source"):
+        if column not in existing_columns:
+            cur.execute(f"ALTER TABLE download_history ADD COLUMN {column} TEXT")
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_download_history_source_extid "
+        "ON download_history (source, external_id)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_download_history_canonical_url "
+        "ON download_history (canonical_url)"
+    )
     conn.commit()
 
 def is_music_media_type(value):
@@ -247,6 +293,9 @@ class DownloadJobStore:
             media_intent=row["media_intent"],
             source=row["source"],
             url=row["url"],
+            input_url=row.get("input_url"),
+            canonical_url=row.get("canonical_url"),
+            external_id=row.get("external_id"),
             status=row["status"],
             queued=row["queued"],
             claimed=row["claimed"],
@@ -416,6 +465,9 @@ class DownloadJobStore:
         media_intent,
         source,
         url,
+        input_url=None,
+        canonical_url=None,
+        external_id=None,
         output_template=None,
         max_attempts=3,
         trace_id=None,
@@ -427,6 +479,12 @@ class DownloadJobStore:
         destination = resolved_destination
         if destination is None and output_template:
             destination = (output_template or {}).get("output_dir")
+
+        input_url = input_url or url
+        if external_id is None and source in {"youtube", "youtube_music"}:
+            external_id = extract_video_id(url)
+        if canonical_url is None:
+            canonical_url = canonicalize_url(source, input_url, external_id)
 
         duplicate = self.find_duplicate_job(
             canonical_id=canonical_id,
@@ -464,25 +522,29 @@ class DownloadJobStore:
                     cur.execute("BEGIN IMMEDIATE")
                     cur.execute(
                         """
-                        INSERT INTO download_jobs (
-                            id, origin, origin_id, media_type, media_intent, source, url,
-                            status, queued, claimed, downloading, postprocessing, completed,
-                            failed, canceled, attempts, max_attempts, created_at, updated_at,
-                            last_error, trace_id, output_template, resolved_destination, canonical_id
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            job_id,
-                            origin,
-                            origin_id,
-                            media_type,
-                            media_intent,
-                            source,
-                            url,
-                            JOB_STATUS_QUEUED,
-                            now,
-                            None,
-                            None,
+                INSERT INTO download_jobs (
+                    id, origin, origin_id, media_type, media_intent, source, url,
+                    input_url, canonical_url, external_id,
+                    status, queued, claimed, downloading, postprocessing, completed,
+                    failed, canceled, attempts, max_attempts, created_at, updated_at,
+                    last_error, trace_id, output_template, resolved_destination, canonical_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    origin,
+                    origin_id,
+                    media_type,
+                    media_intent,
+                    source,
+                    url,
+                    input_url,
+                    canonical_url,
+                    external_id,
+                    JOB_STATUS_QUEUED,
+                    now,
+                    None,
+                    None,
                             None,
                             None,
                             None,
@@ -1169,6 +1231,36 @@ def resolve_source(url):
     if "youtube.com" in host or "youtu.be" in host:
         return "youtube"
     return "unknown"
+
+
+def canonicalize_url(source: str, url: str | None, external_id: str | None) -> str | None:
+    """
+    Return a stable canonical URL for matching and deduplication.
+    """
+    try:
+        source = (source or "").strip().lower()
+        if source in {"youtube", "youtube_music"}:
+            video_id = external_id or extract_video_id(url)
+            if not video_id:
+                return None
+            return f"https://www.youtube.com/watch?v={video_id}"
+        if source == "soundcloud":
+            if not url or not isinstance(url, str):
+                return None
+            parsed = urllib.parse.urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                return None
+            return url
+        if source == "bandcamp":
+            if not url or not isinstance(url, str):
+                return None
+            parsed = urllib.parse.urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                return None
+            return urllib.parse.urlunparse(parsed._replace(scheme="https"))
+        return None
+    except Exception:
+        return None
 
 
 def is_youtube_music_url(url):
@@ -1968,13 +2060,50 @@ def record_download_history(db_path, job, filepath, *, meta=None):
     if not video_id:
         video_id = extract_video_id(job.url) or job.id
     playlist_id = job.origin_id if job.origin == "playlist" else None
+    input_url = job.input_url or job.url
+    external_id = job.external_id
+    source = job.source
+    canonical_url = job.canonical_url
+    if not canonical_url:
+        canonical_url = canonicalize_url(source, input_url, external_id)
     conn = sqlite3.connect(db_path, check_same_thread=False)
     try:
         ensure_downloads_table(conn)
+        ensure_download_history_table(conn)
         cur = conn.cursor()
         cur.execute(
             "INSERT OR REPLACE INTO downloads (video_id, playlist_id, downloaded_at, filepath) VALUES (?, ?, ?, ?)",
             (video_id, playlist_id, utc_now(), filepath),
+        )
+        file_size_bytes = None
+        try:
+            file_size_bytes = int(os.stat(filepath).st_size)
+        except OSError:
+            file_size_bytes = None
+        now = utc_now()
+        title = meta.get("title") if isinstance(meta, dict) else None
+        cur.execute(
+            """
+            INSERT INTO download_history (
+                video_id, title, filename, destination, source, status,
+                created_at, completed_at, file_size_bytes,
+                input_url, canonical_url, external_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                video_id,
+                title,
+                os.path.basename(filepath),
+                os.path.dirname(filepath),
+                source,
+                "completed",
+                now,
+                now,
+                file_size_bytes,
+                input_url,
+                canonical_url,
+                external_id,
+            ),
         )
         conn.commit()
     finally:
