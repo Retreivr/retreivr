@@ -1,82 +1,3 @@
-// --- Home-only typography + card polish ---
-(function injectHomeStyles() {
-  if (document.getElementById("home-style-patch")) return;
-  const style = document.createElement("style");
-  style.id = "home-style-patch";
-  style.textContent = `
-    body.home-page {
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont;
-    }
-
-    body.home-page .home-result-card {
-      background: rgba(255,255,255,0.03);
-      border-radius: 14px;
-      padding: 14px 16px;
-      margin-bottom: 14px;
-      border: 1px solid rgba(255,255,255,0.06);
-    }
-
-    body.home-page .home-candidate-row {
-      background: rgba(255,255,255,0.02);
-    }
-
-    body.home-page .home-candidate-source-tag {
-      display: inline-block;
-      margin-top: 6px;
-      font-size: 12px;
-      opacity: 0.7;
-    }
-
-    body.home-page .home-candidate-action .button {
-      border-radius: 999px;
-    }
-  `;
-  document.head.appendChild(style);
-})();
-
-// --- Home-only: source selector multi-select panel (checkbox dropdown) ---
-(function injectHomeSourcePanel() {
-  if (document.getElementById("home-source-panel-style")) return;
-
-  const style = document.createElement("style");
-  style.id = "home-source-panel-style";
-  style.textContent = `
-    body.home-page .home-source-toggle {
-      background: rgba(255,255,255,0.05);
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 10px;
-      padding: 8px 12px;
-      cursor: pointer;
-      font-size: 14px;
-    }
-
-    body.home-page .home-source-panel {
-      position: absolute;
-      z-index: 20;
-      background: #111;
-      border: 1px solid rgba(255,255,255,0.1);
-      border-radius: 12px;
-      padding: 10px;
-      margin-top: 6px;
-      display: none;
-      min-width: 220px;
-    }
-
-    body.home-page .home-source-panel.open {
-      display: block;
-    }
-
-    body.home-page .home-source-panel label {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 6px 4px;
-      font-size: 14px;
-      cursor: pointer;
-    }
-  `;
-  document.head.appendChild(style);
-})();
 const state = {
   config: null,
   timers: {},
@@ -254,6 +175,7 @@ function setPage(page) {
   document.body.classList.remove("nav-open");
   // Home-only root class for scoping styles
   document.body.classList.toggle("home-page", target === "home");
+  document.body.dataset.page = target;
   const navToggle = $("#nav-toggle");
   if (navToggle) {
     navToggle.setAttribute("aria-expanded", "false");
@@ -1635,6 +1557,7 @@ function showHomeResults(visible) {
   const section = $("#home-results");
   if (!section) return;
   section.classList.toggle("hidden", !visible);
+  section.classList.remove("has-results");
 }
 
 function updateHomeViewAdvancedLink() {
@@ -1726,8 +1649,6 @@ function buildHomeResultsStatusInfo(requestId) {
   const error = request.error || "";
   const minScore = Number.isFinite(request.min_match_score) ? request.min_match_score : null;
   const thresholdText = Number.isFinite(minScore) ? minScore.toFixed(2) : "0.00";
-  const bestScore = state.homeBestScores[requestId];
-  const bestText = Number.isFinite(bestScore) ? bestScore.toFixed(2) : "calculating…";
   const hasCandidates = items.some((item) => item.candidate_count > 0);
   const allowQueued = state.homeSearchMode !== "searchOnly";
   const hasQueued = allowQueued && items.some((item) => ["enqueued", "skipped"].includes(item.status));
@@ -1738,7 +1659,7 @@ function buildHomeResultsStatusInfo(requestId) {
 
   if (requestStatus === "failed" && error === "no_items_enqueued") {
     if (hasCandidates) {
-      const detail = `Best score ${bestText} · Threshold ${thresholdText}. Lower the threshold or use Advanced Search to enqueue a result.`;
+      const detail = `Results found below the auto-download threshold. Use Advanced Search to enqueue a result.`;
       return { text: "Results found (below auto-download threshold)", detail, isError: false, status: requestStatus };
     }
     return {
@@ -1974,6 +1895,10 @@ async function loadHomeCandidates(item, container) {
     if (placeholder.parentElement) {
       placeholder.remove();
     }
+    const resultsSection = $("#home-results");
+    if (resultsSection) {
+      resultsSection.classList.add("has-results");
+    }
     let rendered = state.homeCandidateCache[item.id];
     if (!rendered) {
       rendered = new Set();
@@ -2012,82 +1937,53 @@ async function loadHomeCandidates(item, container) {
 function renderHomeCandidateRow(candidate, item) {
   const row = document.createElement("div");
   row.className = "home-candidate-row";
-  // Ensure proper layout
-  row.style.display = "flex";
-  row.style.alignItems = "center";
-  row.style.width = "100%";
-
-  // Modernize row height + spacing (updated)
-  row.style.minHeight = "110px";
-  row.style.borderRadius = "12px";
-  row.style.padding = "12px";
-  row.style.gap = "16px";
 
   const artworkUrl =
-    (Array.isArray(candidate.canonical_metadata?.artwork)
-      ? candidate.canonical_metadata.artwork[0]?.url
-      : null) ||
-    candidate.canonical_metadata?.thumbnail ||
     candidate.thumbnail_url ||
+    candidate.artwork_url ||
     null;
   const artwork = document.createElement("div");
   artwork.className = "home-candidate-artwork";
-  // Artwork sizing and styling (updated)
-  artwork.style.width = "140px";
-  artwork.style.minWidth = "140px";
-  artwork.style.height = "100%";
-  artwork.style.display = "flex";
-  artwork.style.alignItems = "center";
-  artwork.style.justifyContent = "center";
-  artwork.style.overflow = "hidden";
-  artwork.style.background = "rgba(255,255,255,0.04)";
-  artwork.style.borderRadius = "10px";
   if (artworkUrl) {
     const img = document.createElement("img");
     img.src = artworkUrl;
     img.alt = candidate.source || "";
-    img.style.width = "100%";
-    img.style.height = "100%";
-    img.style.objectFit = "cover";
-    img.style.borderRadius = "8px";
     artwork.appendChild(img);
-  } else {
-    artwork.innerHTML = "";
   }
   row.appendChild(artwork);
 
   const info = document.createElement("div");
   info.className = "home-candidate-info";
-  // Info container flex styling
-  info.style.flex = "1";
-  info.style.display = "flex";
-  info.style.flexDirection = "column";
-  info.style.justifyContent = "center";
+  const sourceLabelMap = {
+    youtube: "YouTube",
+    youtube_music: "YouTube Music",
+    soundcloud: "SoundCloud",
+    bandcamp: "Bandcamp",
+  };
+  const sourceKey = (candidate.source || "").toLowerCase();
+  const sourceLabel = sourceLabelMap[sourceKey] || candidate.source || "Unknown";
   const title = candidate.title || candidate.source || "-";
   const detail = [candidate.artist_detected, candidate.album_detected, candidate.track_detected]
     .filter(Boolean)
     .join(" / ");
-  info.innerHTML = `
-    <div style="font-weight:600;font-size:16px;line-height:1.3">${title}</div>
-    ${detail ? `<div class="home-candidate-meta" style="opacity:0.7;font-size:13px;margin-top:4px">${detail}</div>` : ""}
-  `;
-  // Move source info inline, reduce DOM clutter
-  info.insertAdjacentHTML(
-    "beforeend",
-    `<span class="home-candidate-source-tag">${candidate.source || "unknown"}</span>`
-  );
+  const titleEl = document.createElement("div");
+  titleEl.className = "home-candidate-title";
+  titleEl.textContent = title;
+  info.appendChild(titleEl);
+  if (detail) {
+    const metaEl = document.createElement("div");
+    metaEl.className = "home-candidate-meta";
+    metaEl.textContent = detail;
+    info.appendChild(metaEl);
+  }
+  const sourceEl = document.createElement("span");
+  sourceEl.className = "home-candidate-source-tag";
+  sourceEl.textContent = sourceLabel;
+  info.appendChild(sourceEl);
   row.appendChild(info);
-
-  // Removed extra source column for cleaner structure
 
   const action = document.createElement("div");
   action.className = "home-candidate-action";
-  // Action container flex styling
-  action.style.display = "flex";
-  action.style.flexDirection = "column";
-  action.style.gap = "8px";
-  action.style.justifyContent = "center";
-  // Intentionally omit state badge to reduce visual clutter
   const allowDownload = (candidate.allow_download ?? item.allow_download);
   const canDownload = allowDownload !== false;
   const isSearchOnly = state.homeSearchMode === "searchOnly";
@@ -2249,6 +2145,10 @@ function showHomeDirectUrlError(url, message, messageEl) {
     container.textContent = "";
     container.appendChild(renderHomeDirectUrlCard(state.homeDirectPreview, "failed"));
   }
+  const resultsSection = $("#home-results");
+  if (resultsSection) {
+    resultsSection.classList.add("has-results");
+  }
 }
 
 function showHomeDirectUrlPreview(preview) {
@@ -2269,6 +2169,10 @@ function showHomeDirectUrlPreview(preview) {
   container.textContent = "";
   const card = renderHomeDirectUrlCard(preview, "candidate_found");
   container.appendChild(card);
+  const resultsSection = $("#home-results");
+  if (resultsSection) {
+    resultsSection.classList.add("has-results");
+  }
 }
 
 function stopHomeDirectJobPolling() {
@@ -2397,6 +2301,11 @@ async function refreshHomeResults(requestId) {
       placeholder.className = "home-results-empty";
       placeholder.textContent = "Searching sources…";
       container.appendChild(placeholder);
+      const resultsSection = $("#home-results");
+      const terminal = ["completed", "completed_with_skips", "failed"].includes(requestStatus);
+      if (resultsSection) {
+        resultsSection.classList.toggle("has-results", terminal);
+      }
       return requestStatus;
     }
     const currentIds = new Set();
@@ -2421,6 +2330,12 @@ async function refreshHomeResults(requestId) {
     existingCards.forEach((card) => {
       card.remove();
     });
+    const hasResults = items.some((entry) => entry.candidate_count > 0);
+    const terminal = ["completed", "completed_with_skips", "failed"].includes(requestStatus);
+    const resultsSection = $("#home-results");
+    if (resultsSection) {
+      resultsSection.classList.toggle("has-results", hasResults || terminal);
+    }
     Object.keys(state.homeCandidateCache).forEach((key) => {
       if (!currentIds.has(key)) {
         delete state.homeCandidateCache[key];
@@ -2434,6 +2349,10 @@ async function refreshHomeResults(requestId) {
     errorEl.className = "home-results-empty";
     errorEl.textContent = `Failed to refresh results: ${err.message}`;
     container.appendChild(errorEl);
+    const resultsSection = $("#home-results");
+    if (resultsSection) {
+      resultsSection.classList.add("has-results");
+    }
     setHomeResultsStatus("FAILED");
     setHomeResultsDetail(`Failed to refresh results: ${err.message}`, true);
     setHomeSearchControlsEnabled(true);
@@ -4167,6 +4086,11 @@ document.addEventListener("DOMContentLoaded", () => {
   const observer = new MutationObserver(() => {
     const visible = !homeSection.classList.contains("page-hidden");
     document.body.classList.toggle("home-page", visible);
+    if (visible) {
+      document.body.dataset.page = "home";
+    } else if (state.currentPage) {
+      document.body.dataset.page = state.currentPage;
+    }
   });
 
   observer.observe(homeSection, { attributes: true, attributeFilter: ["class"] });
@@ -4174,4 +4098,9 @@ document.addEventListener("DOMContentLoaded", () => {
   // initial state
   const visible = !homeSection.classList.contains("page-hidden");
   document.body.classList.toggle("home-page", visible);
+  if (visible) {
+    document.body.dataset.page = "home";
+  } else if (state.currentPage) {
+    document.body.dataset.page = state.currentPage;
+  }
 })();
