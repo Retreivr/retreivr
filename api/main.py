@@ -704,6 +704,48 @@ def _record_direct_url_history(db_path, files, source_url):
     conn.close()
 
 # Fast-lane direct URL download via yt-dlp CLI
+def _build_direct_url_cli_args(*, url: str, outtmpl: str, final_format_override: str | None) -> list[str]:
+    """
+    Build yt-dlp CLI argv for the direct URL fast-lane.
+    IMPORTANT: This function is a mechanical refactor of the previous inline args logic.
+    It must not change behavior.
+    """
+    def _looks_like_playlist(u: str) -> bool:
+        u = (u or "").lower()
+        # Conservative heuristic: only allow playlist downloads when the user actually pasted a playlist URL.
+        # This keeps single-video URLs behaving like the CLI test (`--no-playlist`).
+        return (
+            "list=" in u
+            or "/playlist" in u
+            or "playlist?" in u
+            or "?playlist" in u
+        )
+
+    args: list[str] = ["yt-dlp"]
+
+    # Match the proven CLI behavior for single-video URLs.
+    # If the URL looks like a playlist URL, do NOT add --no-playlist.
+    if not _looks_like_playlist(url):
+        args.append("--no-playlist")
+
+    # Output template
+    args += ["-o", outtmpl]
+
+    # Optional final container override
+    if final_format_override:
+        fmt = final_format_override.strip().lower()
+        audio_formats = {"mp3", "m4a", "flac", "wav", "opus", "ogg"}
+        video_formats = {"webm", "mp4", "mkv"}
+        if fmt in audio_formats:
+            args += ["-f", "bestaudio", "--extract-audio", "--audio-format", fmt]
+        elif fmt in video_formats:
+            args += ["--merge-output-format", fmt]
+        else:
+            args += ["--merge-output-format", final_format_override]
+
+    args.append(url)
+    return args
+
 def _run_direct_url_with_cli(
     *,
     url: str,
@@ -738,52 +780,16 @@ def _run_direct_url_with_cli(
     temp_dir = os.path.join(paths.temp_downloads_dir, job_id)
     ensure_dir(temp_dir)
 
-
     # Output template: keep simple and CLI-equivalent
     # Note: if the template is absolute, yt-dlp ignores --paths; so keep it absolute here.
     outtmpl = os.path.join(temp_dir, "%(title).200s-%(id)s.%(ext)s")
 
-    def _looks_like_playlist(u: str) -> bool:
-        u = (u or "").lower()
-        # Conservative heuristic: only allow playlist downloads when the user actually pasted a playlist URL.
-        # This keeps single-video URLs behaving like the CLI test (`--no-playlist`).
-        return (
-            "list=" in u
-            or "/playlist" in u
-            or "playlist?" in u
-            or "?playlist" in u
-        )
-
-    args = [
-        "yt-dlp",
-    ]
-
-    # Match the proven CLI behavior for single-video URLs.
-    # If the URL looks like a playlist URL, do NOT add --no-playlist.
-    if not _looks_like_playlist(url):
-        args.append("--no-playlist")
-
-    # Output template
-    args += ["-o", outtmpl]
-
-    # Optional final container override
-    if final_format_override:
-        fmt = final_format_override.strip().lower()
-        audio_formats = {"mp3", "m4a", "flac", "wav", "opus", "ogg"}
-        video_formats = {"webm", "mp4", "mkv"}
-        if fmt in audio_formats:
-            args += ["-f", "bestaudio", "--extract-audio", "--audio-format", fmt]
-        elif fmt in video_formats:
-            args += ["--merge-output-format", fmt]
-        else:
-            args += ["--merge-output-format", final_format_override]
-
-    # Cookies are NOT passed by default for the fast lane.
-    # Rationale: user verified the minimal CLI works reliably without cookies; cookies can change
-    # selected formats/auth flows and can trigger fragment 403s depending on the session.
-    # If you want cookies for a specific site, add a config flag later (e.g. direct_url_use_cookies).
-
-    args.append(url)
+    # Build the CLI args using the new helper
+    args = _build_direct_url_cli_args(
+        url=url,
+        outtmpl=outtmpl,
+        final_format_override=final_format_override,
+    )
 
     def _redact_cli_args(argv: list[str]) -> list[str]:
         redacted: list[str] = []
