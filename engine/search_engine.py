@@ -108,6 +108,10 @@ def _is_http_url(value: str | None) -> bool:
     value = value.strip().lower()
     return value.startswith("http://") or value.startswith("https://")
 
+# Helper: Coerce to HTTP(S) URL or None
+def _coerce_http_url(value: str | None) -> str | None:
+    return value if _is_http_url(value) else None
+
 # Helper: Detect if a value is a URL
 def _is_url(value: str | None) -> bool:
     if not value or not isinstance(value, str):
@@ -611,7 +615,7 @@ class SearchJobStore:
                         candidate["id"],
                         item_id,
                         candidate.get("source"),
-                        candidate.get("url"),
+                        _coerce_http_url(candidate.get("url")),
                         candidate.get("title"),
                         candidate.get("uploader"),
                         candidate.get("artist_detected"),
@@ -648,7 +652,7 @@ class SearchJobStore:
                 (
                     status,
                     chosen.get("source") if chosen else None,
-                    chosen.get("url") if chosen else None,
+                    _coerce_http_url(chosen.get("url")) if chosen else None,
                     chosen.get("final_score") if chosen else None,
                     error,
                     item_id,
@@ -1148,7 +1152,8 @@ class SearchResolutionService:
         candidate = self.store.get_candidate(candidate_id)
         if not candidate or candidate.get("item_id") != item_id:
             return None
-        if not candidate.get("url"):
+        candidate_url = candidate.get("url")
+        if not _is_http_url(candidate_url):
             return None
         request = self.store.get_request_row(item.get("request_id"))
         if not request:
@@ -1188,7 +1193,7 @@ class SearchResolutionService:
             media_type=item.get("media_type") or "generic",
             media_intent=media_intent,
             source=candidate.get("source"),
-            url=candidate.get("url"),
+            url=candidate_url,
             output_template=output_template,
             trace_id=trace_id,
             resolved_destination=resolved_destination,
