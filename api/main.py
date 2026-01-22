@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from uuid import uuid4
 from urllib.parse import urlparse
+from typing import Optional
 
 import anyio
 from fastapi import Body, FastAPI, HTTPException, Query, Request
@@ -342,6 +343,7 @@ def _purge_oauth_sessions():
 
 class EnqueueCandidatePayload(BaseModel):
     candidate_id: str
+    final_format: Optional[str] = None
 
 
 class SpotifyPlaylistImportPayload(BaseModel):
@@ -3078,7 +3080,7 @@ async def enqueue_search_candidate(item_id: str, payload: EnqueueCandidatePayloa
         "single_url": True,
         "url": url,
         "media_type": item.get("media_type"),
-        "final_format": payload.final_format,
+        "final_format": getattr(payload, "final_format", None),
         "destination": service._resolve_request_destination(
             service.store.get_request_row(item["request_id"]).get("destination_dir")
         ),

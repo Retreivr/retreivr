@@ -28,6 +28,9 @@ class SearchAdapter:
     def source_modifier(self, candidate):
         return 1.0
 
+    def _candidate_thumbnail_url(self, entry):
+        return None
+
 
 class _YtDlpSearchMixin(SearchAdapter):
     search_prefix = ""
@@ -95,6 +98,10 @@ class _YtDlpSearchMixin(SearchAdapter):
                 "isrc": isrc,
                 "track_count": track_count,
             }
+            candidate["thumbnail_url"] = None
+            thumbnail_url = self._candidate_thumbnail_url(entry)
+            if thumbnail_url:
+                candidate["thumbnail_url"] = thumbnail_url
             results.append(candidate)
         return results
 
@@ -113,6 +120,15 @@ class YouTubeMusicAdapter(_YtDlpSearchMixin):
     source = "youtube_music"
     search_prefix = "ytsearch"
 
+    def _candidate_thumbnail_url(self, entry):
+        video_id = entry.get("id")
+        if not isinstance(video_id, str):
+            return None
+        video_id = video_id.strip()
+        if not video_id:
+            return None
+        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
     def source_modifier(self, candidate):
         if candidate.get("official"):
             return 1.0
@@ -123,6 +139,15 @@ class YouTubeAdapter(_YtDlpSearchMixin):
     source = "youtube"
     search_prefix = "ytsearch"
 
+    def _candidate_thumbnail_url(self, entry):
+        video_id = entry.get("id")
+        if not isinstance(video_id, str):
+            return None
+        video_id = video_id.strip()
+        if not video_id:
+            return None
+        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
     def source_modifier(self, candidate):
         # Neutral weight for general video content
         return 0.85
@@ -132,6 +157,16 @@ class SoundCloudAdapter(_YtDlpSearchMixin):
     source = "soundcloud"
     search_prefix = "scsearch"
 
+    def _candidate_thumbnail_url(self, entry):
+        artwork_url = entry.get("artwork_url")
+        if not isinstance(artwork_url, str):
+            return None
+        artwork_url = artwork_url.strip()
+        if not artwork_url:
+            return None
+        upgraded = artwork_url.replace("-large", "-t500x500")
+        return upgraded if _is_http_url(upgraded) else None
+
     def source_modifier(self, candidate):
         return 0.95
 
@@ -139,6 +174,15 @@ class SoundCloudAdapter(_YtDlpSearchMixin):
 class BandcampAdapter(_YtDlpSearchMixin):
     source = "bandcamp"
     search_prefix = "bandcampsearch"
+
+    def _candidate_thumbnail_url(self, entry):
+        for key in ("thumbnail_url", "image"):
+            value = entry.get(key)
+            if isinstance(value, str):
+                value = value.strip()
+                if value and _is_http_url(value):
+                    return value
+        return None
 
     def source_modifier(self, candidate):
         return 1.05
