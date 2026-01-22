@@ -75,6 +75,11 @@ class SearchRequest:
 def _utc_now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
+def _is_http_url(value: str | None) -> bool:
+    if not value or not isinstance(value, str):
+        return False
+    value = value.strip().lower()
+    return value.startswith("http://") or value.startswith("https://")
 
 # Helper: Detect if a value is a URL
 def _is_url(value: str | None) -> bool:
@@ -169,6 +174,10 @@ def ensure_search_tables(conn):
         cur.execute("ALTER TABLE search_requests ADD COLUMN destination_dir TEXT")
     if "auto_enqueue" not in existing_requests:
         cur.execute("ALTER TABLE search_requests ADD COLUMN auto_enqueue INTEGER DEFAULT 1")
+    if "adapters_total" not in existing_requests:
+        cur.execute("ALTER TABLE search_requests ADD COLUMN adapters_total INTEGER")
+    if "adapters_completed" not in existing_requests:
+        cur.execute("ALTER TABLE search_requests ADD COLUMN adapters_completed INTEGER")
 
 
     cur.execute(
@@ -633,6 +642,34 @@ class SearchJobStore:
             conn.commit()
         finally:
             conn.close()
+    
+    def update_request_progress(self, request_id, *, adapters_total=None, adapters_completed=None):
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            fields = []
+            params = []
+            if adapters_total is not None:
+                fields.append("adapters_total=?")
+                params.append(adapters_total)
+            if adapters_completed is not None:
+                fields.append("adapters_completed=?")
+                params.append(adapters_completed)
+            if not fields:
+                return
+            params.append(_utc_now())
+            params.append(request_id)
+            cur.execute(
+                f"""
+                UPDATE search_requests
+                SET {", ".join(fields)}, updated_at=?
+                WHERE id=?
+                """,
+                params,
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 class SearchResolutionService:
@@ -758,6 +795,11 @@ class SearchResolutionService:
             # Step #1: Progressive search results - adapter progress state
             adapters_total = len(_parse_source_priority(request_row.get("source_priority_json")))
             adapters_completed = 0
+            self.store.update_request_progress(
+                request_id,
+                adapters_total=adapters_total,
+                adapters_completed=0,
+            )
 
             canonical_payload = None
             if self.canonical_resolver:
@@ -788,6 +830,10 @@ class SearchResolutionService:
                             source=source,
                         )
                         adapters_completed += 1
+                        self.store.update_request_progress(
+                            request_id,
+                            adapters_completed=adapters_completed,
+                        )
                         continue
 
                     self.store.update_item_status(item["id"], "searching_source")
@@ -825,9 +871,23 @@ class SearchResolutionService:
                             error=str(exc),
                         )
                         adapters_completed += 1
+                        self.store.update_request_progress(
+                            request_id,
+                            adapters_completed=adapters_completed,
+                        )
                         continue
 
                     for cand in candidates:
+                        if not _is_http_url(cand.get("url")):
+                            _log_event(
+                                logging.WARNING,
+                                "adapter_candidate_invalid_url",
+                                request_id=request_id,
+                                item_id=item["id"],
+                                source=source,
+                                url=cand.get("url"),
+                            )
+                            continue
                         cand["source"] = source
                         modifier = self.adapters[source].source_modifier(cand)
                         scores = score_candidate(item, cand, source_modifier=modifier)
@@ -864,6 +924,10 @@ class SearchResolutionService:
                         source=source,
                         adapters_completed=adapters_completed,
                         adapters_total=adapters_total,
+                    )
+                    self.store.update_request_progress(
+                        request_id,
+                        adapters_completed=adapters_completed,
                     )
 
             # --- Final selection logic below: do not change ---
@@ -1044,6 +1108,10 @@ class SearchResolutionService:
             self.store.update_request_status(request_id, "completed_with_skips")
         else:
             self.store.update_request_status(request_id, "failed", error="no_items_enqueued")
+            self.store.update_request_progress(
+                request_id,
+                adapters_completed=adapters_total,
+            )
         return request_id
 
     def enqueue_item_candidate(self, item_id, candidate_id):
