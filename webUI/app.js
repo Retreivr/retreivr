@@ -1471,6 +1471,34 @@ function getHomeSourcePriority() {
   return checked;
 }
 
+function updateHomeSourceToggleLabel() {
+  const toggle = $("#home-source-toggle");
+  const panel = $("#home-source-panel");
+  if (!toggle || !panel) return;
+  const inputs = Array.from(
+    panel.querySelectorAll("input[type=checkbox][data-source]")
+  );
+  if (!inputs.length) return;
+  const checked = inputs.filter((input) => input.checked);
+  if (checked.length === inputs.length) {
+    toggle.textContent = "Sources: All";
+    return;
+  }
+  if (!checked.length) {
+    toggle.textContent = "Sources: None";
+    return;
+  }
+  const labelMap = {
+    youtube: "YouTube",
+    youtube_music: "YouTube Music",
+    soundcloud: "SoundCloud",
+    bandcamp: "Bandcamp",
+  };
+  const labels = checked.map((input) => labelMap[input.dataset.source] || input.dataset.source);
+  const summary = labels.length <= 2 ? labels.join(", ") : `${labels.length} selected`;
+  toggle.textContent = `Sources: ${summary}`;
+}
+
 function parseHomeSearchQuery(value, preferAlbum) {
   const trimmed = (value || "").trim();
   if (!trimmed) {
@@ -3768,6 +3796,39 @@ function bindEvents() {
   const homeSearchOnly = $("#home-search-only");
   if (homeSearchOnly) {
     homeSearchOnly.addEventListener("click", () => submitHomeSearch(false));
+  }
+  const homeSourceToggle = $("#home-source-toggle");
+  const homeSourcePanel = $("#home-source-panel");
+  if (homeSourceToggle && homeSourcePanel) {
+    const closePanel = () => {
+      homeSourcePanel.classList.remove("open");
+      homeSourceToggle.setAttribute("aria-expanded", "false");
+    };
+    homeSourceToggle.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const open = homeSourcePanel.classList.toggle("open");
+      homeSourceToggle.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+    homeSourcePanel.addEventListener("click", (event) => {
+      event.stopPropagation();
+    });
+    document.addEventListener("click", (event) => {
+      if (homeSourcePanel.contains(event.target) || homeSourceToggle.contains(event.target)) {
+        return;
+      }
+      closePanel();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        closePanel();
+      }
+    });
+    homeSourcePanel
+      .querySelectorAll("input[type=checkbox][data-source]")
+      .forEach((input) => {
+        input.addEventListener("change", updateHomeSourceToggleLabel);
+      });
+    updateHomeSourceToggleLabel();
   }
 const homeAdvancedToggle = $("#home-advanced-toggle");
 const homeAdvancedPanel = $("#home-advanced-options");

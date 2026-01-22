@@ -48,10 +48,27 @@
           autocomplete="off"
         />
 
-        <div id="home-source-filters" class="home-source-filters"></div>
+        <div id="home-source-filters" class="home-source-filters">
+          <button
+            id="home-source-toggle"
+            class="home-source-toggle"
+            type="button"
+            aria-expanded="false"
+            aria-controls="home-source-panel"
+          >
+            Sources: All
+          </button>
+          <div id="home-source-panel" class="home-source-panel" role="menu">
+            <label><input type="checkbox" data-source="youtube" checked> YouTube</label>
+            <label><input type="checkbox" data-source="youtube_music" checked> YouTube Music</label>
+            <label><input type="checkbox" data-source="soundcloud" checked> SoundCloud</label>
+            <label><input type="checkbox" data-source="bandcamp" checked> Bandcamp</label>
+          </div>
+        </div>
 
         <div class="home-search-actions">
           <button id="home-search-only" class="button primary">Search</button>
+          <button id="home-search-download" class="button ghost">Search &amp; Download</button>
         </div>
 
         <div id="home-search-message" class="notice" role="status">
