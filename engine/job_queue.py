@@ -221,7 +221,7 @@ class DownloadJobStore:
         self.db_path = db_path
 
     def _connect(self):
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -454,44 +454,55 @@ class DownloadJobStore:
         conn = self._connect()
         try:
             cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO download_jobs (
-                    id, origin, origin_id, media_type, media_intent, source, url,
-                    status, queued, claimed, downloading, postprocessing, completed,
-                    failed, canceled, attempts, max_attempts, created_at, updated_at,
-                    last_error, trace_id, output_template, resolved_destination, canonical_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job_id,
-                    origin,
-                    origin_id,
-                    media_type,
-                    media_intent,
-                    source,
-                    url,
-                    JOB_STATUS_QUEUED,
-                    now,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    0,
-                    max_attempts,
-                    now,
-                    now,
-                    None,
-                    trace_id,
-                    output_template_json,
-                    destination,
-                    canonical_id,
-                ),
-            )
-            conn.commit()
-            return job_id, True, None
+            # Retry a few times on transient SQLite write contention (rapid multi-click enqueue).
+            for attempt in range(5):
+                try:
+                    cur.execute("BEGIN IMMEDIATE")
+                    cur.execute(
+                        """
+                        INSERT INTO download_jobs (
+                            id, origin, origin_id, media_type, media_intent, source, url,
+                            status, queued, claimed, downloading, postprocessing, completed,
+                            failed, canceled, attempts, max_attempts, created_at, updated_at,
+                            last_error, trace_id, output_template, resolved_destination, canonical_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            job_id,
+                            origin,
+                            origin_id,
+                            media_type,
+                            media_intent,
+                            source,
+                            url,
+                            JOB_STATUS_QUEUED,
+                            now,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            0,
+                            max_attempts,
+                            now,
+                            now,
+                            None,
+                            trace_id,
+                            output_template_json,
+                            destination,
+                            canonical_id,
+                        ),
+                    )
+                    conn.commit()
+                    return job_id, True, None
+                except sqlite3.OperationalError as exc:
+                    msg = str(exc).lower()
+                    if "locked" in msg or "busy" in msg:
+                        conn.rollback()
+                        time.sleep(0.05 * (2**attempt))
+                        continue
+                    raise
         finally:
             conn.close()
 
@@ -1131,6 +1142,14 @@ def build_ytdlp_opts(context):
     overrides = context.get("overrides") or {}
     allow_chapter_outtmpl = bool(context.get("allow_chapter_outtmpl"))
 
+    normalized_audio_target = _normalize_audio_format(target_format)
+    normalized_target = _normalize_format(target_format)
+
+    # If a video job accidentally receives an audio codec as "final_format" (e.g. global config),
+    # do NOT interpret it as a yt-dlp "format" selector. That causes invalid downloads.
+    # We only treat webm/mp4/mkv as container preferences for video mode here.
+    video_container_target = normalized_target if normalized_target in {"webm", "mp4", "mkv"} else None
+
     def _url_looks_like_playlist(u: str | None) -> bool:
         if not u:
             return False
@@ -1202,9 +1221,8 @@ def build_ytdlp_opts(context):
         # Only enable addmetadata, embedthumbnail, writethumbnail, and audio postprocessors
         # when both audio_mode and media_type is music/audio
         if audio_mode and is_music_media_type(context.get("media_type")):
-            normalized_audio = _normalize_audio_format(target_format)
-            if normalized_audio and normalized_audio in _AUDIO_FORMATS:
-                opts["postprocessors"] = _build_audio_postprocessors(normalized_audio)
+            if normalized_audio_target and normalized_audio_target in _AUDIO_FORMATS:
+                opts["postprocessors"] = _build_audio_postprocessors(normalized_audio_target)
             else:
                 opts["postprocessors"] = _build_audio_postprocessors(None)
             opts["format"] = _FORMAT_AUDIO
@@ -1214,17 +1232,23 @@ def build_ytdlp_opts(context):
         elif audio_mode:
             opts["format"] = _FORMAT_AUDIO
         else:
-            normalized = _normalize_format(target_format)
-            if normalized in {"webm", "mp4", "mkv"}:
+            # Video mode: honor only container preferences (webm/mp4/mkv).
+            # Never treat an audio codec (mp3/m4a/flac/...) as a yt-dlp format selector.
+            if video_container_target:
                 opts["format"] = "bestvideo+bestaudio/best"
-                opts["merge_output_format"] = normalized
-            elif normalized:
-                opts["format"] = normalized
+                opts["merge_output_format"] = video_container_target
             else:
                 opts["format"] = _FORMAT_VIDEO
 
-    opts = _merge_overrides(opts, overrides, operation=operation, lock_format=bool(target_format))
+    # Only lock down format-related overrides when the target_format was actually applied
+    # (audio codec in audio_mode, or video container preference in video mode).
+    lock_format = False
+    if audio_mode and normalized_audio_target:
+        lock_format = True
+    if (not audio_mode) and video_container_target:
+        lock_format = True
 
+    opts = _merge_overrides(opts, overrides, operation=operation, lock_format=lock_format)
     if operation == "download":
         for key in _YTDLP_DOWNLOAD_UNSAFE_KEYS:
             opts.pop(key, None)
