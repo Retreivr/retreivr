@@ -1,3 +1,27 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
+MAX_PARALLEL_ADAPTERS = 4
+
+# Helper to run one adapter safely
+def _run_adapter_search(adapter, item, max_candidates, canonical_payload):
+    """
+    Execute a single adapter search safely.
+    Returns a list of candidate dicts (may be empty).
+    """
+    if item["item_type"] == "album":
+        candidates = adapter.search_album(item["artist"], item.get("album"), max_candidates)
+    else:
+        candidates = adapter.search_track(
+            item["artist"],
+            item.get("track"),
+            item.get("album"),
+            max_candidates,
+        )
+    out = []
+    for cand in candidates or []:
+        cand = dict(cand)
+        cand["canonical_metadata"] = canonical_payload
+        out.append(cand)
+    return out
 import json
 import logging
 import os
@@ -20,6 +44,7 @@ REQUEST_STATUSES = {"pending", "resolving", "completed", "completed_with_skips",
 ITEM_STATUSES = {
     "queued",
     "searching",
+    "searching_source",
     "candidate_found",
     "selected",
     "enqueued",
@@ -730,6 +755,10 @@ class SearchResolutionService:
             self.store.update_item_status(item["id"], "searching")
             _log_event(logging.INFO, "item_searching", request_id=request_id, item_id=item["id"])
 
+            # Step #1: Progressive search results - adapter progress state
+            adapters_total = len(_parse_source_priority(request_row.get("source_priority_json")))
+            adapters_completed = 0
+
             canonical_payload = None
             if self.canonical_resolver:
                 if item["item_type"] == "album":
@@ -745,32 +774,99 @@ class SearchResolutionService:
             max_candidates = int(request_row.get("max_candidates_per_source") or 5)
             scored = []
 
-            for source in source_priority:
-                adapter = self.adapters.get(source)
-                if not adapter:
-                    _log_event(logging.ERROR, "adapter_missing", request_id=request_id, item_id=item["id"], source=source)
-                    continue
+            # --- Parallel adapter execution (bounded) ---
+            futures = {}
+            with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_ADAPTERS, len(source_priority))) as pool:
+                for source in source_priority:
+                    adapter = self.adapters.get(source)
+                    if not adapter:
+                        _log_event(
+                            logging.ERROR,
+                            "adapter_missing",
+                            request_id=request_id,
+                            item_id=item["id"],
+                            source=source,
+                        )
+                        adapters_completed += 1
+                        continue
 
-                if item["item_type"] == "album":
-                    candidates = adapter.search_album(item["artist"], item.get("album"), max_candidates)
-                else:
-                    candidates = adapter.search_track(
-                        item["artist"],
-                        item.get("track"),
-                        item.get("album"),
-                        max_candidates,
+                    self.store.update_item_status(item["id"], "searching_source")
+                    _log_event(
+                        logging.INFO,
+                        "adapter_search_started",
+                        request_id=request_id,
+                        item_id=item["id"],
+                        source=source,
+                        adapters_completed=adapters_completed,
+                        adapters_total=adapters_total,
                     )
 
-                for cand in candidates:
-                    cand["source"] = source
-                    cand["canonical_metadata"] = canonical_payload
-                    modifier = adapter.source_modifier(cand)
-                    scores = score_candidate(item, cand, source_modifier=modifier)
-                    cand.update(scores)
-                    cand["canonical_json"] = safe_json_dumps(canonical_payload) if canonical_payload else None
-                    cand["id"] = uuid4().hex
-                    scored.append(cand)
+                    futures[
+                        pool.submit(
+                            _run_adapter_search,
+                            adapter,
+                            item,
+                            max_candidates,
+                            canonical_payload,
+                        )
+                    ] = source
 
+                for fut in as_completed(futures):
+                    source = futures[fut]
+                    try:
+                        candidates = fut.result()
+                    except Exception as exc:
+                        _log_event(
+                            logging.ERROR,
+                            "adapter_search_failed",
+                            request_id=request_id,
+                            item_id=item["id"],
+                            source=source,
+                            error=str(exc),
+                        )
+                        adapters_completed += 1
+                        continue
+
+                    for cand in candidates:
+                        cand["source"] = source
+                        modifier = self.adapters[source].source_modifier(cand)
+                        scores = score_candidate(item, cand, source_modifier=modifier)
+                        cand.update(scores)
+                        cand["canonical_json"] = safe_json_dumps(canonical_payload) if canonical_payload else None
+                        cand["id"] = uuid4().hex
+                        scored.append(cand)
+
+                    if candidates:
+                        # Insert partial candidates immediately for progressive UI updates
+                        partial_ranked = rank_candidates(
+                            scored,
+                            source_priority=source_priority,
+                        )
+                        self.store.reset_candidates_for_item(item["id"])
+                        self.store.insert_candidates(item["id"], partial_ranked)
+                        _log_event(
+                            logging.INFO,
+                            "adapter_candidates_emitted",
+                            request_id=request_id,
+                            item_id=item["id"],
+                            source=source,
+                            candidates_total=len(partial_ranked),
+                            adapters_completed=adapters_completed,
+                            adapters_total=adapters_total,
+                        )
+
+                    adapters_completed += 1
+                    _log_event(
+                        logging.INFO,
+                        "adapter_search_completed",
+                        request_id=request_id,
+                        item_id=item["id"],
+                        source=source,
+                        adapters_completed=adapters_completed,
+                        adapters_total=adapters_total,
+                    )
+
+            # --- Final selection logic below: do not change ---
             if not scored:
                 self.store.update_item_status(item["id"], "failed", error="no_candidates")
                 _log_event(logging.WARNING, "item_failed", request_id=request_id, item_id=item["id"], error="no_candidates")
