@@ -2012,11 +2012,16 @@ async function loadHomeCandidates(item, container) {
 function renderHomeCandidateRow(candidate, item) {
   const row = document.createElement("div");
   row.className = "home-candidate-row";
-  // Modernize row height + spacing
-  row.style.minHeight = "140px";
+  // Ensure proper layout
+  row.style.display = "flex";
+  row.style.alignItems = "center";
+  row.style.width = "100%";
+
+  // Modernize row height + spacing (updated)
+  row.style.minHeight = "110px";
   row.style.borderRadius = "12px";
-  row.style.padding = "12px 14px";
-  row.style.gap = "14px";
+  row.style.padding = "12px";
+  row.style.gap = "16px";
 
   const artworkUrl =
     (Array.isArray(candidate.canonical_metadata?.artwork)
@@ -2027,18 +2032,22 @@ function renderHomeCandidateRow(candidate, item) {
     null;
   const artwork = document.createElement("div");
   artwork.className = "home-candidate-artwork";
-  artwork.style.width = "160px";
-  artwork.style.minWidth = "160px";
-  artwork.style.height = "90px"; // 16:9 YouTube-style
+  // Artwork sizing and styling (updated)
+  artwork.style.width = "140px";
+  artwork.style.minWidth = "140px";
+  artwork.style.height = "100%";
   artwork.style.display = "flex";
   artwork.style.alignItems = "center";
   artwork.style.justifyContent = "center";
+  artwork.style.overflow = "hidden";
+  artwork.style.background = "rgba(255,255,255,0.04)";
+  artwork.style.borderRadius = "10px";
   if (artworkUrl) {
     const img = document.createElement("img");
     img.src = artworkUrl;
     img.alt = candidate.source || "";
-    img.style.maxWidth = "100%";
-    img.style.maxHeight = "100%";
+    img.style.width = "100%";
+    img.style.height = "100%";
     img.style.objectFit = "cover";
     img.style.borderRadius = "8px";
     artwork.appendChild(img);
@@ -2049,6 +2058,11 @@ function renderHomeCandidateRow(candidate, item) {
 
   const info = document.createElement("div");
   info.className = "home-candidate-info";
+  // Info container flex styling
+  info.style.flex = "1";
+  info.style.display = "flex";
+  info.style.flexDirection = "column";
+  info.style.justifyContent = "center";
   const title = candidate.title || candidate.source || "-";
   const detail = [candidate.artist_detected, candidate.album_detected, candidate.track_detected]
     .filter(Boolean)
@@ -2068,6 +2082,11 @@ function renderHomeCandidateRow(candidate, item) {
 
   const action = document.createElement("div");
   action.className = "home-candidate-action";
+  // Action container flex styling
+  action.style.display = "flex";
+  action.style.flexDirection = "column";
+  action.style.gap = "8px";
+  action.style.justifyContent = "center";
   // Intentionally omit state badge to reduce visual clutter
   const allowDownload = (candidate.allow_download ?? item.allow_download);
   const canDownload = allowDownload !== false;
