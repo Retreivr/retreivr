@@ -1,3 +1,82 @@
+// --- Home-only typography + card polish ---
+(function injectHomeStyles() {
+  if (document.getElementById("home-style-patch")) return;
+  const style = document.createElement("style");
+  style.id = "home-style-patch";
+  style.textContent = `
+    body.home-page {
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont;
+    }
+
+    body.home-page .home-result-card {
+      background: rgba(255,255,255,0.03);
+      border-radius: 14px;
+      padding: 14px 16px;
+      margin-bottom: 14px;
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+
+    body.home-page .home-candidate-row {
+      background: rgba(255,255,255,0.02);
+    }
+
+    body.home-page .home-candidate-source-tag {
+      display: inline-block;
+      margin-top: 6px;
+      font-size: 12px;
+      opacity: 0.7;
+    }
+
+    body.home-page .home-candidate-action .button {
+      border-radius: 999px;
+    }
+  `;
+  document.head.appendChild(style);
+})();
+
+// --- Home-only: source selector multi-select panel (checkbox dropdown) ---
+(function injectHomeSourcePanel() {
+  if (document.getElementById("home-source-panel-style")) return;
+
+  const style = document.createElement("style");
+  style.id = "home-source-panel-style";
+  style.textContent = `
+    body.home-page .home-source-toggle {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 10px;
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    body.home-page .home-source-panel {
+      position: absolute;
+      z-index: 20;
+      background: #111;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      padding: 10px;
+      margin-top: 6px;
+      display: none;
+      min-width: 220px;
+    }
+
+    body.home-page .home-source-panel.open {
+      display: block;
+    }
+
+    body.home-page .home-source-panel label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 4px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+  `;
+  document.head.appendChild(style);
+})();
 const state = {
   config: null,
   timers: {},
@@ -69,9 +148,10 @@ const RELEASE_CACHE_KEY = "yt_archiver_release_cache";
 const RELEASE_VERSION_KEY = "yt_archiver_release_app_version";
 const HOME_SOURCE_PRIORITY_MAP = {
   auto: null,
-  youtube: ["youtube", "youtube_music"],
+  youtube: ["youtube"],
+  youtube_music: ["youtube_music"],
   soundcloud: ["soundcloud"],
-  archive: null,
+  bandcamp: ["bandcamp"],
 };
 const HOME_GENERIC_SOURCE_PRIORITY = ["youtube_music", "soundcloud", "bandcamp", "youtube"];
 const HOME_VIDEO_SOURCE_PRIORITY = ["youtube", "youtube_music", "soundcloud", "bandcamp"];
@@ -172,6 +252,8 @@ function setPage(page) {
     updateHomeViewAdvancedLink();
   }
   document.body.classList.remove("nav-open");
+  // Home-only root class for scoping styles
+  document.body.classList.toggle("home-page", target === "home");
   const navToggle = $("#nav-toggle");
   if (navToggle) {
     navToggle.setAttribute("aria-expanded", "false");
@@ -1444,10 +1526,27 @@ function renderSearchEmptyRow(body, colspan, message) {
 }
 
 function getHomeSourcePriority() {
-  const select = $("#home-search-source");
-  if (!select) return null;
-  const value = select.value;
-  return HOME_SOURCE_PRIORITY_MAP[value] || null;
+  const panel = $("#home-source-panel");
+  if (!panel) return null;
+
+  const checked = Array.from(
+    panel.querySelectorAll("input[type=checkbox][data-source]:checked")
+  ).map((el) => el.dataset.source);
+
+  if (!checked.length) {
+    return null;
+  }
+
+  // If all sources selected, treat as auto (null)
+  const allSources = Array.from(
+    panel.querySelectorAll("input[type=checkbox][data-source]")
+  ).map((el) => el.dataset.source);
+
+  if (checked.length === allSources.length) {
+    return null;
+  }
+
+  return checked;
 }
 
 function parseHomeSearchQuery(value, preferAlbum) {
@@ -1787,18 +1886,8 @@ function renderHomeResultItem(item) {
   header.appendChild(title);
   header.appendChild(renderHomeStatusBadge(item.status));
   card.appendChild(header);
-  const detail = document.createElement("div");
-  detail.className = "home-candidate-title";
-  detail.textContent = `Source: ${item.media_type || "generic"} · ${item.position ? `Item ${item.position}` : ""}`.trim();
-  card.appendChild(detail);
-  const requestContext = state.homeRequestContext[item.request_id];
-  const resolvedDestination = requestContext?.request?.resolved_destination;
-  if (resolvedDestination) {
-    const destinationEl = document.createElement("div");
-    destinationEl.className = "home-result-destination";
-    destinationEl.textContent = `Destination: ${resolvedDestination}`;
-    card.appendChild(destinationEl);
-  }
+  // Remove destination line for Home page result cards (visual polish)
+  // No destination line
   const candidateList = document.createElement("div");
   candidateList.className = "home-candidate-list";
   candidateList.dataset.itemId = item.id || "";
@@ -1923,6 +2012,12 @@ async function loadHomeCandidates(item, container) {
 function renderHomeCandidateRow(candidate, item) {
   const row = document.createElement("div");
   row.className = "home-candidate-row";
+  // Modernize row height + spacing
+  row.style.minHeight = "140px";
+  row.style.borderRadius = "12px";
+  row.style.padding = "12px 14px";
+  row.style.gap = "14px";
+
   const artworkUrl =
     (Array.isArray(candidate.canonical_metadata?.artwork)
       ? candidate.canonical_metadata.artwork[0]?.url
@@ -1932,9 +2027,9 @@ function renderHomeCandidateRow(candidate, item) {
     null;
   const artwork = document.createElement("div");
   artwork.className = "home-candidate-artwork";
-  artwork.style.width = "96px";
-  artwork.style.minWidth = "96px";
-  artwork.style.height = "96px";
+  artwork.style.width = "160px";
+  artwork.style.minWidth = "160px";
+  artwork.style.height = "90px"; // 16:9 YouTube-style
   artwork.style.display = "flex";
   artwork.style.alignItems = "center";
   artwork.style.justifyContent = "center";
@@ -1945,7 +2040,7 @@ function renderHomeCandidateRow(candidate, item) {
     img.style.maxWidth = "100%";
     img.style.maxHeight = "100%";
     img.style.objectFit = "cover";
-    img.style.borderRadius = "4px";
+    img.style.borderRadius = "8px";
     artwork.appendChild(img);
   } else {
     artwork.innerHTML = "";
@@ -1958,13 +2053,18 @@ function renderHomeCandidateRow(candidate, item) {
   const detail = [candidate.artist_detected, candidate.album_detected, candidate.track_detected]
     .filter(Boolean)
     .join(" / ");
-  info.innerHTML = `<span class="home-candidate-source">${title}</span>${detail ? `<span class="home-candidate-meta">${detail}</span>` : ""}`;
+  info.innerHTML = `
+    <div style="font-weight:600;font-size:16px;line-height:1.3">${title}</div>
+    ${detail ? `<div class="home-candidate-meta" style="opacity:0.7;font-size:13px;margin-top:4px">${detail}</div>` : ""}
+  `;
+  // Move source info inline, reduce DOM clutter
+  info.insertAdjacentHTML(
+    "beforeend",
+    `<span class="home-candidate-source-tag">${candidate.source || "unknown"}</span>`
+  );
   row.appendChild(info);
 
-  const source = document.createElement("div");
-  source.className = "home-candidate-meta";
-  source.textContent = candidate.source || "unknown";
-  row.appendChild(source);
+  // Removed extra source column for cleaner structure
 
   const action = document.createElement("div");
   action.className = "home-candidate-action";
