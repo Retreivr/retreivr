@@ -39,6 +39,10 @@ TERMINAL_STATUSES = (
     JOB_STATUS_CANCELLED,
 )
 
+# --- CancelledError for job cancellation
+class CancelledError(Exception):
+    """Raised to abort an in-flight download due to user cancellation."""
+
 _FORMAT_VIDEO = (
     "bestvideo[ext=webm][height<=1080]+bestaudio[ext=webm]/"
     "bestvideo[ext=webm][height<=720]+bestaudio[ext=webm]/"
@@ -717,6 +721,8 @@ class DownloadWorkerEngine:
             conn.close()
         self._locks = {}
         self._locks_lock = threading.Lock()
+        self._cancel_flags = {}
+        self._cancel_lock = threading.Lock()
 
     def run_once(self, *, stop_event=None):
         sources = self.store.list_sources_with_queued_jobs()
@@ -755,12 +761,50 @@ class DownloadWorkerEngine:
                 self._locks[source] = lock
             return lock
 
+    def cancel_job(self, job_id: str, *, reason: str | None = None) -> bool:
+        """
+        Request cancellation of a specific job.
+        - Marks the job as CANCELLED in the DB (so UI updates immediately).
+        - If the job is actively downloading, the progress hook will abort the yt-dlp run.
+        """
+        reason = reason or "Cancelled by user"
+        try:
+            # Mark cancelled immediately for UI/state correctness.
+            self.store.mark_canceled(job_id, reason=reason)
+        except Exception:
+            logging.exception("Failed to mark job cancelled in store: %s", job_id)
+
+        with self._cancel_lock:
+            evt = self._cancel_flags.get(job_id)
+            if evt is None:
+                evt = threading.Event()
+                self._cancel_flags[job_id] = evt
+            evt.set()
+        return True
+
+    def _is_job_cancelled(self, job_id: str, stop_event: threading.Event | None) -> bool:
+        if stop_event and stop_event.is_set():
+            return True
+        try:
+            if self.store.get_job_status(job_id) == JOB_STATUS_CANCELLED:
+                return True
+        except Exception:
+            pass
+        with self._cancel_lock:
+            evt = self._cancel_flags.get(job_id)
+            return bool(evt and evt.is_set())
+
     def _run_source_once(self, source, lock, stop_event):
         try:
             if stop_event and stop_event.is_set():
                 return
             job = self.store.claim_next_job(source)
             if not job:
+                return
+            # If a cancel request came in while this job was queued, honor it immediately.
+            if self._is_job_cancelled(job.id, stop_event):
+                self.store.mark_canceled(job.id, reason="Cancelled by user")
+                _log_event(logging.INFO, "job_cancelled", job_id=job.id, trace_id=job.trace_id, source=job.source)
                 return
             _log_event(
                 logging.INFO,
@@ -787,25 +831,16 @@ class DownloadWorkerEngine:
                 media_intent=job.media_intent,
             )
             return
-        if stop_event and stop_event.is_set():
-            error_message = "cancel_requested"
-            self.store.record_failure(
-                job,
-                error_message=error_message,
-                retryable=False,
-                retry_delay_seconds=self.retry_delay_seconds,
-            )
+        if self._is_job_cancelled(job.id, stop_event):
+            self.store.mark_canceled(job.id, reason="Cancelled by user")
             _log_event(
-                logging.ERROR,
-                "job_failed",
+                logging.INFO,
+                "job_cancelled",
                 job_id=job.id,
                 trace_id=job.trace_id,
                 source=job.source,
                 origin=job.origin,
                 media_intent=job.media_intent,
-                retryable=False,
-                status=JOB_STATUS_FAILED,
-                error=error_message,
             )
             return
         adapter = self.adapters.get(job.source)
@@ -839,7 +874,9 @@ class DownloadWorkerEngine:
                 job,
                 self.config,
                 self.paths,
-                stop_event=stop_event,
+                stop_event=None,
+                cancel_check=lambda: self._is_job_cancelled(job.id, stop_event),
+                cancel_reason="Cancelled by user",
                 media_type=job.media_type,
                 media_intent=job.media_intent,
             )
@@ -848,25 +885,16 @@ class DownloadWorkerEngine:
             final_path, meta = result
             if self.store.get_job_status(job.id) == JOB_STATUS_FAILED:
                 return
-            if stop_event and stop_event.is_set():
-                error_message = "cancel_requested"
-                self.store.record_failure(
-                    job,
-                    error_message=error_message,
-                    retryable=False,
-                    retry_delay_seconds=self.retry_delay_seconds,
-                )
+            if self._is_job_cancelled(job.id, stop_event):
+                self.store.mark_canceled(job.id, reason="Cancelled by user")
                 _log_event(
-                    logging.ERROR,
-                    "job_failed",
+                    logging.INFO,
+                    "job_cancelled",
                     job_id=job.id,
                     trace_id=job.trace_id,
                     source=job.source,
                     origin=job.origin,
                     media_intent=job.media_intent,
-                    retryable=False,
-                    status=JOB_STATUS_FAILED,
-                    error=error_message,
                 )
                 return
             self.store.mark_postprocessing(job.id)
@@ -888,6 +916,18 @@ class DownloadWorkerEngine:
                 path=final_path,
             )
         except Exception as exc:
+            if isinstance(exc, CancelledError):
+                self.store.mark_canceled(job.id, reason=str(exc) or "Cancelled by user")
+                _log_event(
+                    logging.INFO,
+                    "job_cancelled",
+                    job_id=job.id,
+                    trace_id=job.trace_id,
+                    source=job.source,
+                    origin=job.origin,
+                    media_intent=job.media_intent,
+                )
+                return
             if (
                 isinstance(exc, TypeError)
                 and "set" in str(exc)
@@ -924,7 +964,7 @@ class DownloadWorkerEngine:
 
 
 class YouTubeAdapter:
-    def execute(self, job, config, paths, *, stop_event=None, media_type=None, media_intent=None):
+    def execute(self, job, config, paths, *, stop_event=None, cancel_check=None, cancel_reason=None, media_type=None, media_intent=None):
         output_template = job.output_template or {}
         output_dir = output_template.get("output_dir") or paths.single_downloads_dir
         raw_final_format = output_template.get("final_format")
@@ -964,6 +1004,8 @@ class YouTubeAdapter:
                 job_id=job.id,
                 origin=job.origin,
                 resolved_destination=job.resolved_destination,
+                cancel_check=cancel_check,
+                cancel_reason=cancel_reason,
             )
             if not info or not local_file:
                 shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1365,9 +1407,11 @@ def download_with_ytdlp(
     job_id=None,
     origin=None,
     resolved_destination=None,
+    cancel_check=None,
+    cancel_reason=None,
 ):
-    if stop_event and stop_event.is_set():
-        return None, None
+    if (stop_event and stop_event.is_set()) or (callable(cancel_check) and cancel_check()):
+        raise CancelledError(cancel_reason or "Cancelled by user")
     # Use an ID-based template in temp_dir (CLI parity and avoids title/path edge cases).
     # The final user-facing name is applied later when we move/rename the completed file.
     output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
@@ -1452,8 +1496,17 @@ def download_with_ytdlp(
                 if isinstance(default_tmpl, str) and default_tmpl.strip()
                 else "%(title).200s-%(id)s.%(ext)s"
             )
+        def _cancel_hook(d):
+            if (stop_event and stop_event.is_set()) or (callable(cancel_check) and cancel_check()):
+                raise CancelledError(cancel_reason or "Cancelled by user")
+
+        hooks = list(opts_for_run.get("progress_hooks") or [])
+        hooks.append(_cancel_hook)
+        opts_for_run["progress_hooks"] = hooks
         with YoutubeDL(opts_for_run) as ydl:
             info = ydl.extract_info(url, download=True)
+            if (stop_event and stop_event.is_set()) or (callable(cancel_check) and cancel_check()):
+                raise CancelledError(cancel_reason or "Cancelled by user")
     except Exception as exc:
         # If a cookiefile is present and yt-dlp reports an empty download, retry once WITHOUT cookies.
         # This matches the observed CLI behavior (no cookies) and avoids poisoning downloads with bad/expired cookies.
@@ -1567,8 +1620,8 @@ def download_with_ytdlp(
                     )
             raise RuntimeError(f"yt_dlp_download_failed: {exc}")
 
-    if stop_event and stop_event.is_set():
-        return None, None
+    if (stop_event and stop_event.is_set()) or (callable(cancel_check) and cancel_check()):
+        raise CancelledError(cancel_reason or "Cancelled by user")
 
     local_path = None
     if isinstance(info, dict):
