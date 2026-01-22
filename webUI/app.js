@@ -1871,7 +1871,7 @@ async function loadHomeCandidates(item, container) {
     const data = await fetchJson(`/api/search/items/${encodeURIComponent(item.id)}/candidates`);
     const candidates = data.candidates || [];
     if (!candidates.length) {
-      placeholder.textContent = "Waiting for candidates…";
+      placeholder.textContent = "Searching…";
       return;
     }
     if (placeholder.parentElement) {
@@ -1926,7 +1926,7 @@ function renderHomeCandidateRow(candidate, item) {
     img.alt = candidate.source || "";
     artwork.appendChild(img);
   } else {
-    artwork.innerHTML = "<span class=\"meta\">No artwork</span>";
+    artwork.innerHTML = "";
   }
   row.appendChild(artwork);
 
@@ -1939,18 +1939,14 @@ function renderHomeCandidateRow(candidate, item) {
   info.innerHTML = `<span class="home-candidate-source">${title}</span>${detail ? `<span class="home-candidate-meta">${detail}</span>` : ""}`;
   row.appendChild(info);
 
-  const score = document.createElement("div");
-  score.textContent = Number.isFinite(candidate.final_score) ? candidate.final_score.toFixed(3) : "-";
-  score.className = "home-candidate-meta";
-  row.appendChild(score);
+  const source = document.createElement("div");
+  source.className = "home-candidate-meta";
+  source.textContent = candidate.source || "unknown";
+  row.appendChild(source);
 
   const action = document.createElement("div");
   action.className = "home-candidate-action";
-  const stateInfo = getHomeCandidateStateInfo(item.status, { searchOnly: state.homeSearchMode === "searchOnly" });
-  const stateBadge = document.createElement("span");
-  stateBadge.className = `home-candidate-state ${stateInfo.className}`;
-  stateBadge.textContent = stateInfo.label;
-  action.appendChild(stateBadge);
+  // Intentionally omit state badge to reduce visual clutter
   const allowDownload = (candidate.allow_download ?? item.allow_download);
   const canDownload = allowDownload !== false;
   const isSearchOnly = state.homeSearchMode === "searchOnly";
