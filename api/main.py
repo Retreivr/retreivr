@@ -237,6 +237,38 @@ class DirectUrlPreviewRequest(BaseModel):
     url: str
 
 
+# Cancel job API request model
+class CancelJobRequest(BaseModel):
+    reason: str | None = None
+
+# Helper to best-effort terminate a subprocess
+def _terminate_subprocess(proc: subprocess.Popen, *, grace_sec: float = 3.0) -> None:
+    """Best-effort terminate a subprocess quickly and safely."""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        return
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    deadline = time.monotonic() + grace_sec
+    while time.monotonic() < deadline:
+        try:
+            if proc.poll() is not None:
+                return
+        except Exception:
+            return
+        time.sleep(0.05)
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
 class ConfigPathRequest(BaseModel):
     path: str
 
@@ -3256,3 +3288,53 @@ if __name__ == "__main__":
     host = _env_or_default("YT_ARCHIVER_HOST", "127.0.0.1")
     port = int(_env_or_default("YT_ARCHIVER_PORT", "8000"))
     uvicorn.run("api.main:app", host=host, port=port, reload=False)
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str, payload: CancelJobRequest = Body(default=CancelJobRequest())):
+    """
+    Cancel a queued/active download job.
+
+    Behavior:
+    - If the job corresponds to the direct-URL fast-lane, terminate the active yt-dlp CLI subprocess.
+    - If the job is a queued worker job, mark it CANCELLED in the download_jobs table and request
+      cancellation from the worker engine (if supported).
+    """
+    reason = (payload.reason or "Cancelled by user").strip() if payload else "Cancelled by user"
+    # 1) Direct URL fast-lane: terminate current CLI process (if this matches)
+    try:
+        current_job_id = getattr(app.state, "current_download_job_id", None)
+        current_proc = getattr(app.state, "current_download_proc", None)
+        if current_job_id and current_job_id == job_id and current_proc:
+            app.state.cancel_requested = True
+            await anyio.to_thread.run_sync(_terminate_subprocess, current_proc)
+            return {"ok": True, "job_id": job_id, "status": "cancelled", "scope": "direct_url"}
+    except Exception:
+        logging.exception("Direct URL cancel path failed")
+
+    # 2) Unified queue jobs: mark cancelled and ask worker to stop if possible
+    try:
+        store = DownloadJobStore(app.state.paths.db_path)
+        try:
+            store.mark_canceled(job_id, reason=reason)
+        except AttributeError:
+            # Backward compatibility: if store method is named differently in this build
+            store.mark_canceled(job_id)
+
+        engine = getattr(app.state, "worker_engine", None)
+        if engine is not None:
+            # Best-effort: only call if the engine exposes a cancellation hook.
+            for attr in ("cancel_job", "request_cancel", "kill_job", "cancel"):
+                fn = getattr(engine, attr, None)
+                if callable(fn):
+                    try:
+                        fn(job_id, reason=reason)
+                    except TypeError:
+                        fn(job_id)
+                    break
+
+        return {"ok": True, "job_id": job_id, "status": "cancelled", "scope": "queue"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logging.exception("Cancel job failed")
+        raise HTTPException(status_code=500, detail=f"Cancel failed: {exc}")
