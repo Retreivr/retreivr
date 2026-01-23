@@ -1607,54 +1607,72 @@ def download_with_ytdlp(
             or "forbidden" in msg_l
         )
 
+    import sys
+    from subprocess import DEVNULL, CalledProcessError
     info = None
+    # Always get metadata via API (for output file info, etc.)
     try:
-        # yt-dlp may mutate the options dict internally; always pass a copy.
-        opts_for_run = dict(opts)
-        # HARD GUARD again on the copy.
-        if isinstance(opts_for_run.get("outtmpl"), dict):
-            default_tmpl = opts_for_run["outtmpl"].get("default")
-            opts_for_run["outtmpl"] = (
-                default_tmpl
-                if isinstance(default_tmpl, str) and default_tmpl.strip()
-                else "%(title).200s-%(id)s.%(ext)s"
-            )
-        def _cancel_hook(d):
-            if (stop_event and stop_event.is_set()) or (callable(cancel_check) and cancel_check()):
-                raise CancelledError(cancel_reason or "Cancelled by user")
-
-        hooks = list(opts_for_run.get("progress_hooks") or [])
-        hooks.append(_cancel_hook)
-        opts_for_run["progress_hooks"] = hooks
-        with YoutubeDL(opts_for_run) as ydl:
-            info = ydl.extract_info(url, download=True)
-            # Log sanitized yt-dlp CLI equivalent after execution is invoked
-            _log_event(
-                logging.INFO,
-                "YTDLP_CLI_EQUIVALENT",
-                job_id=job_id,
-                url=url,
-                cli=_render_ytdlp_cli(_redact_ytdlp_opts(opts_for_run), url),
-            )
-            if (stop_event and stop_event.is_set()) or (callable(cancel_check) and cancel_check()):
-                raise CancelledError(cancel_reason or "Cancelled by user")
+        opts_for_probe = dict(opts)
+        opts_for_probe["skip_download"] = True
+        with YoutubeDL(opts_for_probe) as ydl:
+            info = ydl.extract_info(url, download=False)
     except Exception as exc:
-        message = str(exc) or ""
-        lowered = message.lower()
-        if (
-            "postprocessing" in lowered
-            or "postprocessor" in lowered
-            or "ffmpeg" in lowered
-            or "conversion failed" in lowered
-        ):
-            raise PostprocessingError(message)
-        if info is None:
-            # If a cookiefile is present and yt-dlp reports an empty download, retry once WITHOUT cookies.
-            # This matches the observed CLI behavior (no cookies) and avoids poisoning downloads with bad/expired cookies.
-            if _is_empty_download_error(exc) and opts.get("cookiefile"):
-                retry_opts = dict(opts)
-                retry_opts.pop("cookiefile", None)
-                # Keep worker logs quiet, but allow yt-dlp to behave normally.
+        _log_event(
+            logging.ERROR,
+            "ytdlp_metadata_probe_failed",
+            job_id=job_id,
+            url=url,
+            error=str(exc),
+        )
+        raise RuntimeError(f"yt_dlp_metadata_probe_failed: {exc}")
+
+    def _is_empty_download_error(e: Exception) -> bool:
+        msg = str(e) or ""
+        msg_l = msg.lower()
+        return (
+            "downloaded file is empty" in msg_l
+            or "http error 403" in msg_l
+            or "forbidden" in msg_l
+        )
+
+    # Prepare CLI command for download
+    opts_for_run = dict(opts)
+    # HARD GUARD again on the copy.
+    if isinstance(opts_for_run.get("outtmpl"), dict):
+        default_tmpl = opts_for_run["outtmpl"].get("default")
+        opts_for_run["outtmpl"] = (
+            default_tmpl
+            if isinstance(default_tmpl, str) and default_tmpl.strip()
+            else "%(title).200s-%(id)s.%(ext)s"
+        )
+    # Remove progress_hooks if present
+    if "progress_hooks" in opts_for_run:
+        opts_for_run.pop("progress_hooks")
+    # Build CLI command
+    cmd = _render_ytdlp_cli(_redact_ytdlp_opts(opts_for_run), url)
+    try:
+        subprocess.run(cmd, shell=True, check=True, stdout=DEVNULL, stderr=DEVNULL)
+        _log_event(
+            logging.INFO,
+            "YTDLP_CLI_EQUIVALENT",
+            job_id=job_id,
+            url=url,
+            cli=cmd,
+        )
+    except CalledProcessError as exc:
+        # If a cookiefile is present and yt-dlp reports an empty download, retry once WITHOUT cookies.
+        if opts.get("cookiefile"):
+            # Try again without cookies if empty/403
+            # Check if file exists in temp_dir, if not, treat as empty/403
+            found = False
+            for entry in os.listdir(temp_dir):
+                if entry.endswith((".part", ".ytdl", ".temp")):
+                    continue
+                candidate = os.path.join(temp_dir, entry)
+                if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                    found = True
+                    break
+            if not found:
                 _log_event(
                     logging.WARNING,
                     "YTDLP_EMPTY_FILE_RETRY_NO_COOKIES",
@@ -1670,19 +1688,19 @@ def download_with_ytdlp(
                     outtmpl=opts.get("outtmpl"),
                     noplaylist=opts.get("noplaylist"),
                 )
+                retry_opts = dict(opts_for_run)
+                retry_opts.pop("cookiefile", None)
+                cmd_retry = _render_ytdlp_cli(_redact_ytdlp_opts(retry_opts), url)
                 try:
-                    retry_opts = dict(opts)
-                    retry_opts.pop("cookiefile", None)
-                    if isinstance(retry_opts.get("outtmpl"), dict):
-                        default_tmpl = retry_opts["outtmpl"].get("default")
-                        retry_opts["outtmpl"] = (
-                            default_tmpl
-                            if isinstance(default_tmpl, str) and default_tmpl.strip()
-                            else "%(title).200s-%(id)s.%(ext)s"
-                        )
-                    with YoutubeDL(retry_opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                except Exception as retry_exc:
+                    subprocess.run(cmd_retry, shell=True, check=True, stdout=DEVNULL, stderr=DEVNULL)
+                    _log_event(
+                        logging.INFO,
+                        "YTDLP_CLI_EQUIVALENT",
+                        job_id=job_id,
+                        url=url,
+                        cli=cmd_retry,
+                    )
+                except CalledProcessError as retry_exc:
                     _log_event(
                         logging.ERROR,
                         "YTDLP_EMPTY_FILE_RETRY_FAILED",
@@ -1696,26 +1714,8 @@ def download_with_ytdlp(
                         error=str(retry_exc),
                         opts=_redact_ytdlp_opts(retry_opts),
                     )
-                    # Fall through to normal failure handling using the original exception.
-
-            if info is None:
-                _log_event(
-                    logging.ERROR,
-                    "YTDLP_FAILED",
-                    job_id=job_id,
-                    url=url,
-                    origin=origin,
-                    media_type=media_type,
-                    media_intent=media_intent,
-                    audio_mode=audio_mode,
-                    final_format=final_format,
-                    format=opts.get("format"),
-                    merge_output_format=opts.get("merge_output_format"),
-                    outtmpl=opts.get("outtmpl"),
-                    noplaylist=opts.get("noplaylist"),
-                    error=str(exc),
-                    opts=_redact_ytdlp_opts(opts),
-                )
+                    raise RuntimeError(f"yt_dlp_download_failed: {retry_exc}")
+            else:
                 _log_event(
                     logging.ERROR,
                     "ytdlp_download_failed",
@@ -1732,34 +1732,25 @@ def download_with_ytdlp(
                     noplaylist=opts.get("noplaylist"),
                     error=str(exc),
                 )
-                if "Requested format is not available" in str(exc):
-                    try:
-                        list_opts = dict(opts)
-                        list_opts["skip_download"] = True
-                        with YoutubeDL(list_opts) as ydl:
-                            info_probe = ydl.extract_info(url, download=False)
-                        summary = _format_summary(info_probe)
-                        _log_event(
-                            logging.ERROR,
-                            "ytdlp_format_summary",
-                            job_id=job_id,
-                            url=url,
-                            format=opts.get("format"),
-                            merge_output_format=opts.get("merge_output_format"),
-                            format_count=summary["format_count"],
-                            exts=summary["exts"],
-                            has_webm=summary["has_webm"],
-                        )
-                    except Exception as probe_exc:
-                        _log_event(
-                            logging.ERROR,
-                            "ytdlp_format_summary_failed",
-                            job_id=job_id,
-                            url=url,
-                            format=opts.get("format"),
-                            error=str(probe_exc),
-                        )
                 raise RuntimeError(f"yt_dlp_download_failed: {exc}")
+        else:
+            _log_event(
+                logging.ERROR,
+                "ytdlp_download_failed",
+                job_id=job_id,
+                url=url,
+                origin=origin,
+                media_type=media_type,
+                media_intent=media_intent,
+                audio_mode=audio_mode,
+                final_format=final_format,
+                format=opts.get("format"),
+                merge_output_format=opts.get("merge_output_format"),
+                outtmpl=opts.get("outtmpl"),
+                noplaylist=opts.get("noplaylist"),
+                error=str(exc),
+            )
+            raise RuntimeError(f"yt_dlp_download_failed: {exc}")
 
     if (stop_event and stop_event.is_set()) or (callable(cancel_check) and cancel_check()):
         raise CancelledError(cancel_reason or "Cancelled by user")
