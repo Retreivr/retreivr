@@ -2121,7 +2121,7 @@ def embed_metadata(local_file, meta, video_id, thumbs_dir):
         os.replace(tmp_path, local_file)
         logging.info("[%s] Metadata embedded successfully", video_id)
     except subprocess.CalledProcessError:
-        logging.exception("ffmpeg metadata embedding failed for %s", video_id)
+        logging.warning("ffmpeg metadata embedding skipped for %s", video_id)
         try:
             os.unlink(tmp_path)
         except Exception:
