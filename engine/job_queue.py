@@ -1508,6 +1508,7 @@ def download_with_ytdlp(
 ):
     if (stop_event and stop_event.is_set()) or (callable(cancel_check) and cancel_check()):
         raise CancelledError(cancel_reason or "Cancelled by user")
+    attempted_audio_fallback = False
     # Use an ID-based template in temp_dir (CLI parity and avoids title/path edge cases).
     # The final user-facing name is applied later when we move/rename the completed file.
     output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
@@ -1613,43 +1614,48 @@ def download_with_ytdlp(
             or "conversion failed" in lowered
         ):
             raise PostprocessingError(message)
-        # If a cookiefile is present and yt-dlp reports an empty download, retry once WITHOUT cookies.
-        # This matches the observed CLI behavior (no cookies) and avoids poisoning downloads with bad/expired cookies.
-        if _is_empty_download_error(exc) and opts.get("cookiefile"):
-            retry_opts = dict(opts)
-            retry_opts.pop("cookiefile", None)
-            # Keep worker logs quiet, but allow yt-dlp to behave normally.
+        if audio_mode and "requested format is not available" in lowered and not attempted_audio_fallback:
+            attempted_audio_fallback = True
             _log_event(
                 logging.WARNING,
-                "YTDLP_EMPTY_FILE_RETRY_NO_COOKIES",
+                "AUDIO_FALLBACK_TO_VIDEO_EXTRACT",
                 job_id=job_id,
                 url=url,
-                origin=origin,
-                media_type=media_type,
-                media_intent=media_intent,
-                audio_mode=audio_mode,
+                original_format=opts.get("format"),
                 final_format=final_format,
-                format=opts.get("format"),
-                merge_output_format=opts.get("merge_output_format"),
-                outtmpl=opts.get("outtmpl"),
-                noplaylist=opts.get("noplaylist"),
             )
             try:
+                fallback_opts = dict(opts)
+                fallback_opts["format"] = "bestvideo+bestaudio/best"
+                fallback_opts.pop("merge_output_format", None)
+                def _fallback_cancel_hook(d):
+                    if (stop_event and stop_event.is_set()) or (callable(cancel_check) and cancel_check()):
+                        raise CancelledError(cancel_reason or "Cancelled by user")
+                hooks = list(fallback_opts.get("progress_hooks") or [])
+                hooks.append(_fallback_cancel_hook)
+                fallback_opts["progress_hooks"] = hooks
+                with YoutubeDL(fallback_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if (stop_event and stop_event.is_set()) or (callable(cancel_check) and cancel_check()):
+                        raise CancelledError(cancel_reason or "Cancelled by user")
+            except Exception as fallback_exc:
+                exc = fallback_exc
+                message = str(exc) or ""
+                lowered = message.lower()
+            else:
+                pass
+        if info is not None:
+            pass
+        else:
+        # If a cookiefile is present and yt-dlp reports an empty download, retry once WITHOUT cookies.
+        # This matches the observed CLI behavior (no cookies) and avoids poisoning downloads with bad/expired cookies.
+            if _is_empty_download_error(exc) and opts.get("cookiefile"):
                 retry_opts = dict(opts)
                 retry_opts.pop("cookiefile", None)
-                if isinstance(retry_opts.get("outtmpl"), dict):
-                    default_tmpl = retry_opts["outtmpl"].get("default")
-                    retry_opts["outtmpl"] = (
-                        default_tmpl
-                        if isinstance(default_tmpl, str) and default_tmpl.strip()
-                        else "%(title).200s-%(id)s.%(ext)s"
-                    )
-                with YoutubeDL(retry_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-            except Exception as retry_exc:
+                # Keep worker logs quiet, but allow yt-dlp to behave normally.
                 _log_event(
-                    logging.ERROR,
-                    "YTDLP_EMPTY_FILE_RETRY_FAILED",
+                    logging.WARNING,
+                    "YTDLP_EMPTY_FILE_RETRY_NO_COOKIES",
                     job_id=job_id,
                     url=url,
                     origin=origin,
@@ -1657,73 +1663,101 @@ def download_with_ytdlp(
                     media_intent=media_intent,
                     audio_mode=audio_mode,
                     final_format=final_format,
-                    error=str(retry_exc),
-                    opts=_redact_ytdlp_opts(retry_opts),
+                    format=opts.get("format"),
+                    merge_output_format=opts.get("merge_output_format"),
+                    outtmpl=opts.get("outtmpl"),
+                    noplaylist=opts.get("noplaylist"),
                 )
-                # Fall through to normal failure handling using the original exception.
-
-        if info is None:
-            _log_event(
-                logging.ERROR,
-                "YTDLP_FAILED",
-                job_id=job_id,
-                url=url,
-                origin=origin,
-                media_type=media_type,
-                media_intent=media_intent,
-                audio_mode=audio_mode,
-                final_format=final_format,
-                format=opts.get("format"),
-                merge_output_format=opts.get("merge_output_format"),
-                outtmpl=opts.get("outtmpl"),
-                noplaylist=opts.get("noplaylist"),
-                error=str(exc),
-                opts=_redact_ytdlp_opts(opts),
-            )
-            _log_event(
-                logging.ERROR,
-                "ytdlp_download_failed",
-                job_id=job_id,
-                url=url,
-                origin=origin,
-                media_type=media_type,
-                media_intent=media_intent,
-                audio_mode=audio_mode,
-                final_format=final_format,
-                format=opts.get("format"),
-                merge_output_format=opts.get("merge_output_format"),
-                outtmpl=opts.get("outtmpl"),
-                noplaylist=opts.get("noplaylist"),
-                error=str(exc),
-            )
-            if "Requested format is not available" in str(exc):
                 try:
-                    list_opts = dict(opts)
-                    list_opts["skip_download"] = True
-                    with YoutubeDL(list_opts) as ydl:
-                        info_probe = ydl.extract_info(url, download=False)
-                    summary = _format_summary(info_probe)
+                    retry_opts = dict(opts)
+                    retry_opts.pop("cookiefile", None)
+                    if isinstance(retry_opts.get("outtmpl"), dict):
+                        default_tmpl = retry_opts["outtmpl"].get("default")
+                        retry_opts["outtmpl"] = (
+                            default_tmpl
+                            if isinstance(default_tmpl, str) and default_tmpl.strip()
+                            else "%(title).200s-%(id)s.%(ext)s"
+                        )
+                    with YoutubeDL(retry_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                except Exception as retry_exc:
                     _log_event(
                         logging.ERROR,
-                        "ytdlp_format_summary",
+                        "YTDLP_EMPTY_FILE_RETRY_FAILED",
                         job_id=job_id,
                         url=url,
-                        format=opts.get("format"),
-                        merge_output_format=opts.get("merge_output_format"),
-                        format_count=summary["format_count"],
-                        exts=summary["exts"],
-                        has_webm=summary["has_webm"],
+                        origin=origin,
+                        media_type=media_type,
+                        media_intent=media_intent,
+                        audio_mode=audio_mode,
+                        final_format=final_format,
+                        error=str(retry_exc),
+                        opts=_redact_ytdlp_opts(retry_opts),
                     )
-                except Exception as probe_exc:
-                    _log_event(
-                        logging.ERROR,
-                        "ytdlp_format_summary_failed",
-                        job_id=job_id,
-                        url=url,
-                        format=opts.get("format"),
-                        error=str(probe_exc),
-                    )
-            raise RuntimeError(f"yt_dlp_download_failed: {exc}")
+                    # Fall through to normal failure handling using the original exception.
+
+            if info is None:
+                _log_event(
+                    logging.ERROR,
+                    "YTDLP_FAILED",
+                    job_id=job_id,
+                    url=url,
+                    origin=origin,
+                    media_type=media_type,
+                    media_intent=media_intent,
+                    audio_mode=audio_mode,
+                    final_format=final_format,
+                    format=opts.get("format"),
+                    merge_output_format=opts.get("merge_output_format"),
+                    outtmpl=opts.get("outtmpl"),
+                    noplaylist=opts.get("noplaylist"),
+                    error=str(exc),
+                    opts=_redact_ytdlp_opts(opts),
+                )
+                _log_event(
+                    logging.ERROR,
+                    "ytdlp_download_failed",
+                    job_id=job_id,
+                    url=url,
+                    origin=origin,
+                    media_type=media_type,
+                    media_intent=media_intent,
+                    audio_mode=audio_mode,
+                    final_format=final_format,
+                    format=opts.get("format"),
+                    merge_output_format=opts.get("merge_output_format"),
+                    outtmpl=opts.get("outtmpl"),
+                    noplaylist=opts.get("noplaylist"),
+                    error=str(exc),
+                )
+                if "Requested format is not available" in str(exc):
+                    try:
+                        list_opts = dict(opts)
+                        list_opts["skip_download"] = True
+                        with YoutubeDL(list_opts) as ydl:
+                            info_probe = ydl.extract_info(url, download=False)
+                        summary = _format_summary(info_probe)
+                        _log_event(
+                            logging.ERROR,
+                            "ytdlp_format_summary",
+                            job_id=job_id,
+                            url=url,
+                            format=opts.get("format"),
+                            merge_output_format=opts.get("merge_output_format"),
+                            format_count=summary["format_count"],
+                            exts=summary["exts"],
+                            has_webm=summary["has_webm"],
+                        )
+                    except Exception as probe_exc:
+                        _log_event(
+                            logging.ERROR,
+                            "ytdlp_format_summary_failed",
+                            job_id=job_id,
+                            url=url,
+                            format=opts.get("format"),
+                            error=str(probe_exc),
+                        )
+                raise RuntimeError(f"yt_dlp_download_failed: {exc}")
 
     if (stop_event and stop_event.is_set()) or (callable(cancel_check) and cancel_check()):
         raise CancelledError(cancel_reason or "Cancelled by user")
