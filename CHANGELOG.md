@@ -2,6 +2,68 @@
 
 All notable changes to this project will be documented here.
 
+## [v0.9.2] – Search Engine Dialed In // Home Page UI Update
+
+Highlights
+
+This release hardens the download pipeline (especially audio-only MP3), improves observability, and simplifies the Home UI ahead of broader feature work. Video downloads remain stable and unchanged.
+
+⸻
+
+🚀 Improvements
+	•	Reliable MP3 audio-only downloads
+	•	Audio mode now uses a robust bestaudio[acodec!=none]/bestaudio/best selector.
+	•	Prevents unnecessary video downloads when targeting MP3.
+	•	Matches known-working yt-dlp CLI behavior.
+	•	Works consistently for direct URLs and queued jobs.
+	•	Safer yt-dlp option handling
+	•	Avoids forced merge/remux unless explicitly required.
+	•	Reduces ffmpeg post-processing failures.
+	•	Audio and video paths are now clearly separated and predictable.
+	•	yt-dlp CLI observability
+	•	Job workers now log the exact yt-dlp CLI command executed (with secrets redacted).
+	•	Makes debugging format, cookie, and extractor issues significantly easier.
+
+⸻
+
+🧠 Behavior Fixes
+	•	Post-processing failures are now terminal
+	•	ffmpeg / post-processing errors correctly mark jobs as FAILED.
+	•	Prevents silent re-queue loops and misleading “Queued” states in the UI.
+	•	Video pipeline preserved
+	•	Default video behavior (bestvideo+bestaudio/best) remains unchanged.
+	•	MP4 / MKV / WebM downloads continue to work as before.
+
+⸻
+
+🎧 Music & Metadata
+	•	Music metadata enrichment remains optional
+	•	Failed or low-confidence enrichment no longer blocks successful downloads.
+	•	Clear logging when metadata is skipped due to confidence thresholds.
+
+⸻
+
+🖥 UI / UX
+	•	Home page cleanup
+	•	Reorganized source filters and advanced options into a single compact row.
+	•	Reduced visual noise without removing functionality.
+	•	Improved spacing and alignment for music mode, format, and destination controls.
+	•	Advanced Search remains available
+	•	Advanced functionality is still accessible via the dedicated Advanced Search page.
+
+⸻
+
+🧹 Internal / Maintenance
+	•	Improved internal option auditing logs.
+	•	Better separation between search, enqueue, and execution logic.
+	•	No schema or config migrations required.
+
+⸻
+
+⚠️ Known Notes
+	•	Client-side (“download to this device”) delivery is still being refined and may be disabled or hidden in some UI paths.
+  
+
 ## [v0.9.1] – Runtime Stability & Direct URL Fixes
 
 This release focuses on restoring and hardening runtime stability after refactors since yt-archiver v1.2.0.
