@@ -2066,7 +2066,7 @@ def embed_metadata(local_file, meta, video_id, thumbs_dir):
     audio_only = ext_lower in [".mp3", ".m4a", ".opus", ".aac", ".flac"]
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=f".tagged{base_ext}", dir=os.path.dirname(local_file))
     os.close(tmp_fd)
-
+    MAX_DESC = 2048  # conservative
     try:
         cmd = [
             "ffmpeg",
@@ -2100,9 +2100,12 @@ def embed_metadata(local_file, meta, video_id, thumbs_dir):
         if disc is not None:
             cmd.extend(["-metadata", f"disc={disc}"])
         if date_tag:
-            cmd.extend(["-metadata", f"date={date_tag}"])
+            cmd.extend(["-metadata", f"date={date_tag}"]) 
         if description:
-            cmd.extend(["-metadata", f"description={description}"])
+            safe_desc = description.replace("\n", " ").strip()
+            if len(safe_desc) > MAX_DESC:
+                safe_desc = safe_desc[:MAX_DESC] + "…"
+            cmd.extend(["-metadata", f"description={safe_desc}"])
         if keywords:
             cmd.extend(["-metadata", f"keywords={keywords}"])
         if comment:
